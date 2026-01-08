@@ -14,6 +14,39 @@ pub use ergo_lib::chain::transaction::Transaction;
 pub use ergo_lib::ergotree_ir::chain::ergo_box::{BoxId, ErgoBox, ErgoBoxCandidate};
 pub use ergo_lib::ergotree_ir::chain::token::{Token, TokenAmount, TokenId};
 
+use ergo_chain_types::AutolykosSolution;
+
+/// Create a minimal "genesis parent" header for use when validating the genesis block (height 1).
+/// This header has height 0 and all-zero IDs, serving as the virtual parent of the genesis block.
+pub fn genesis_parent_header() -> Header {
+    let zero_digest = Digest32::zero();
+    let zero_block_id = BlockId(zero_digest);
+
+    // Create minimal AutolykosSolution with default values
+    // Use the identity (infinity) point as a placeholder miner_pk
+    let autolykos_solution = AutolykosSolution {
+        miner_pk: Box::new(ergo_chain_types::ec_point::identity()),
+        pow_onetime_pk: None,
+        nonce: vec![0u8; 8],
+        pow_distance: None,
+    };
+
+    Header {
+        version: 1,
+        id: zero_block_id.clone(),
+        parent_id: zero_block_id.clone(),
+        ad_proofs_root: zero_digest,
+        state_root: ADDigest::zero(),
+        transaction_root: zero_digest,
+        timestamp: 0,
+        n_bits: 0,
+        height: 0,
+        extension_root: zero_digest,
+        autolykos_solution,
+        votes: Votes([0u8; 3]),
+    }
+}
+
 /// Full block containing header, transactions, extension, and AD proofs.
 #[derive(Debug, Clone)]
 pub struct FullBlock {

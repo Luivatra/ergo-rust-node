@@ -3,14 +3,18 @@
 use crate::config::NodeConfig;
 use anyhow::Result;
 use ergo_api::AppState;
-use ergo_consensus::block::{BlockId, BlockTransactions, Digest32, Extension, FullBlock};
+use ergo_consensus::block::{
+    genesis_parent_header, BlockId, BlockTransactions, BoxId, Digest32, ErgoBox, Extension,
+    FullBlock, Header,
+};
+use ergo_consensus::FullBlockValidator;
 use ergo_mempool::Mempool;
 use ergo_mining::{CandidateGenerator, Miner, MinerConfig};
 use ergo_network::{
     DeclaredAddress, Handshake, Message, NetworkCommand, NetworkConfig, NetworkEvent,
     NetworkService, PeerId, PeerManager, PeerSpec, MAINNET_MAGIC, TESTNET_MAGIC,
 };
-use ergo_state::{StateChange, StateManager};
+use ergo_state::{BoxEntry, StateChange, StateManager};
 use ergo_storage::Database;
 use ergo_sync::{SyncCommand, SyncConfig, SyncEvent, SyncProtocol};
 use ergo_wallet::{Wallet, WalletConfig as WalletCfg};
@@ -279,43 +283,70 @@ impl Node {
 
         // Create sync protocol
         let (sync_cmd_tx, mut sync_cmd_rx) = mpsc::channel::<SyncCommand>(100);
-        let (sync_event_tx, mut sync_event_rx) = mpsc::channel::<SyncEvent>(100);
+        // Large buffer for sync events to avoid blocking during header sync
+        // Headers come in batches of 400, so we need enough capacity
+        let (sync_event_tx, mut sync_event_rx) = mpsc::channel::<SyncEvent>(1000);
         let sync_protocol = SyncProtocol::new(SyncConfig::default(), sync_cmd_tx.clone());
 
         // Initialize sync protocol with stored headers from database
         let (_, header_height) = self.state.heights();
         info!("Initializing sync with header_height={}", header_height);
         if header_height > 0 {
-            // Try to get header locator (exponentially spaced headers)
-            match self.state.get_header_locator() {
-                Ok(locator) if !locator.is_empty() => {
-                    info!("Got {} headers from locator", locator.len());
-                    let header_ids: Vec<Vec<u8>> =
-                        locator.iter().map(|id| id.0.as_ref().to_vec()).collect();
-                    sync_protocol.init_from_stored_headers(header_ids);
-                }
-                Ok(_) => {
-                    // Locator empty, try getting headers by range
-                    match self.state.get_headers(1, header_height) {
-                        Ok(headers) if !headers.is_empty() => {
-                            info!("Got {} headers from range query", headers.len());
-                            let header_ids: Vec<Vec<u8>> =
-                                headers.iter().map(|h| h.id.0.as_ref().to_vec()).collect();
-                            sync_protocol.init_from_stored_headers(header_ids);
-                        }
-                        Ok(_) => {
-                            warn!(
-                                "No headers found in storage despite header_height={}",
-                                header_height
-                            );
+            // Set the synchronizer's height to our stored header height
+            sync_protocol.set_height(header_height);
+
+            // Load ALL stored header IDs so sync protocol knows what we already have
+            match self.state.get_headers(1, header_height) {
+                Ok(headers) if !headers.is_empty() => {
+                    info!(
+                        "Loading {} stored headers into sync protocol",
+                        headers.len()
+                    );
+                    let all_header_ids: Vec<Vec<u8>> =
+                        headers.iter().map(|h| h.id.0.as_ref().to_vec()).collect();
+
+                    // Get exponentially spaced locator for SyncInfo messages
+                    let locator_ids = match self.state.get_header_locator() {
+                        Ok(locator) => {
+                            info!("Got {} locator headers for SyncInfo", locator.len());
+                            locator.iter().map(|id| id.0.as_ref().to_vec()).collect()
                         }
                         Err(e) => {
-                            warn!("Failed to get headers from storage: {}", e);
+                            warn!("Failed to get locator, using last headers: {}", e);
+                            // Fallback: use last N headers
+                            all_header_ids.iter().rev().take(21).cloned().collect()
                         }
-                    }
+                    };
+
+                    // Get the most recent headers for V2 SyncInfo (last 10)
+                    let recent_headers: Vec<_> = headers
+                        .iter()
+                        .rev()
+                        .take(10)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev() // Restore oldest-first order
+                        .collect();
+                    info!(
+                        "Got {} recent headers for V2 SyncInfo",
+                        recent_headers.len()
+                    );
+
+                    sync_protocol.init_from_stored_headers(
+                        all_header_ids,
+                        locator_ids,
+                        recent_headers,
+                    );
+                }
+                Ok(_) => {
+                    warn!(
+                        "No headers found in storage despite header_height={}",
+                        header_height
+                    );
                 }
                 Err(e) => {
-                    warn!("Failed to get header locator: {}", e);
+                    warn!("Failed to get headers from storage: {}", e);
                 }
             }
         }
@@ -368,8 +399,13 @@ impl Node {
         let mut peer_handshakes: HashMap<PeerId, Handshake> = HashMap::new();
         // Track peers we want to reconnect to
         let mut reconnect_queue: HashMap<SocketAddr, ReconnectInfo> = HashMap::new();
+        // Track discovered peers from Peers messages (for future connections)
+        let mut discovered_peers: std::collections::HashSet<SocketAddr> =
+            std::collections::HashSet::new();
         // Desired minimum number of connections
         let min_connections: usize = 3;
+        // Maximum number of connections to maintain
+        let max_connections: usize = 10;
 
         tokio::spawn(async move {
             // Tick interval for sync protocol housekeeping (every 1 second)
@@ -385,7 +421,8 @@ impl Node {
                 tokio::select! {
                     // Periodic tick for sync protocol
                     _ = tick_interval.tick() => {
-                        let _ = sync_event_tx_clone.send(SyncEvent::Tick).await;
+                        // Use try_send to avoid blocking if channel is full
+                        let _ = sync_event_tx_clone.try_send(SyncEvent::Tick);
                     }
                     // Periodic reconnection attempts
                     _ = reconnect_interval.tick() => {
@@ -419,6 +456,26 @@ impl Node {
                                 reconnect_queue.remove(&addr);
                             }
                         }
+
+                        // Try connecting to discovered peers if we're below max connections
+                        if connected_count < max_connections && !discovered_peers.is_empty() {
+                            // Take up to 3 discovered peers to try
+                            let peers_to_try: Vec<SocketAddr> = discovered_peers
+                                .iter()
+                                .filter(|addr| !peer_addresses.values().any(|a| a == *addr))
+                                .filter(|addr| !reconnect_queue.contains_key(*addr))
+                                .take(3)
+                                .cloned()
+                                .collect();
+
+                            for addr in peers_to_try {
+                                info!(addr = %addr, "Attempting to connect to discovered peer");
+                                // Remove from discovered set - if connection fails, we won't retry
+                                // (to avoid spamming unreachable peers)
+                                discovered_peers.remove(&addr);
+                                let _ = network_cmd_tx_for_router.send(NetworkCommand::Connect { addr }).await;
+                            }
+                        }
                     }
                     // Handle network events - forward to sync protocol
                     Some(event) = network_event_rx.recv() => {
@@ -436,6 +493,17 @@ impl Node {
                                     info.reset();
                                 }
                                 reconnect_queue.remove(&addr);
+                                // Also remove from discovered peers (we're now connected)
+                                discovered_peers.remove(&addr);
+
+                                // Send GetPeers to discover more peers
+                                info!(peer = %peer_id, "Sending GetPeers request to discover more peers");
+                                let _ = network_cmd_tx_for_router
+                                    .send(NetworkCommand::SendMessage {
+                                        peer_id: peer_id.clone(),
+                                        message: Message::GetPeers,
+                                    })
+                                    .await;
 
                                 let _ = sync_event_tx_clone.send(SyncEvent::PeerConnected {
                                     peer: peer_id,
@@ -469,6 +537,7 @@ impl Node {
                                     &peer_addresses,
                                     &peer_handshakes,
                                     &network_cmd_tx_for_router,
+                                    &mut discovered_peers,
                                 ).await;
                             }
                             NetworkEvent::ConnectionFailed { addr, error } => {
@@ -515,7 +584,7 @@ impl Node {
                                 let height = header.height;
                                 let result = match state_for_router.apply_header(header) {
                                     Ok(_) => {
-                                        debug!(height, "Header stored");
+                                        debug!(height, "Header stored in state");
                                         Ok(())
                                     }
                                     Err(e) => {
@@ -523,7 +592,6 @@ impl Node {
                                         Err(e.to_string())
                                     }
                                 };
-                                // Send response back to sync protocol
                                 let _ = response_tx.send(result);
                             }
                             SyncCommand::ApplyBlock { block_id, block_data } => {
@@ -559,19 +627,106 @@ impl Node {
 
                                 let height = header.height;
 
-                                // Create StateChange from block transactions
-                                let state_change = StateChange::from_block_transactions(&block_txs, height);
+                                // Get parent header for validation
+                                let parent_header = if height > 1 {
+                                    match state_for_router.get_header(&header.parent_id) {
+                                        Ok(Some(h)) => h,
+                                        Ok(None) => {
+                                            warn!(height, "Parent header not found");
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            warn!(height, error = %e, "Failed to get parent header");
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    // For genesis block (height 1), use a minimal parent header
+                                    genesis_parent_header()
+                                };
+
+                                // Create FullBlock (with empty extension for now)
+                                let extension = Extension::empty(header_id.clone());
+                                let full_block = FullBlock::new(header.clone(), block_txs, extension, None);
+
+                                // Get last 10 headers for ErgoScript context
+                                let last_headers: [Header; 10] = {
+                                    let mut headers = Vec::with_capacity(10);
+                                    let start_height = if height > 10 { height - 10 } else { 1 };
+                                    for h in start_height..height {
+                                        if let Ok(Some(hdr)) = state_for_router.history.headers.get_by_height(h) {
+                                            headers.push(hdr);
+                                        }
+                                    }
+                                    // Pad with genesis parent if not enough headers
+                                    while headers.len() < 10 {
+                                        headers.insert(0, genesis_parent_header());
+                                    }
+                                    headers.try_into().unwrap_or_else(|_| std::array::from_fn(|_| genesis_parent_header()))
+                                };
+
+                                // Create block validator and validate
+                                let validator = FullBlockValidator::new();
+                                let utxo_state = &state_for_router.utxo;
+
+                                // Create UTXO lookup closure that returns ErgoBox from BoxEntry
+                                let utxo_lookup = |box_id: &[u8]| -> Option<ErgoBox> {
+                                    utxo_state.get_box_by_bytes(box_id).ok().flatten().map(|entry| entry.ergo_box)
+                                };
+
+                                let validation_result = validator.validate_block(
+                                    &full_block,
+                                    &parent_header,
+                                    utxo_lookup,
+                                    last_headers,
+                                );
+
+                                if !validation_result.valid {
+                                    warn!(
+                                        height,
+                                        block_id = %hex::encode(&block_id),
+                                        error = ?validation_result.error,
+                                        "Block validation failed"
+                                    );
+                                    let _ = sync_event_tx_clone.send(SyncEvent::BlockFailed {
+                                        block_id,
+                                        error: validation_result.error.unwrap_or_else(|| "Unknown validation error".to_string()),
+                                    }).await;
+                                    continue;
+                                }
+
+                                // Extract validated state change
+                                let validated_change = validation_result.state_change.expect("Valid block must have state change");
+
+                                // Convert ValidatedStateChange to StateChange
+                                // spent needs BoxId, created needs BoxEntry
+                                let state_change = StateChange {
+                                    spent: validated_change.spent.iter().filter_map(|s| {
+                                        if s.box_id.len() == 32 {
+                                            let mut arr = [0u8; 32];
+                                            arr.copy_from_slice(&s.box_id);
+                                            Some(BoxId::from(Digest32::from(arr)))
+                                        } else {
+                                            None
+                                        }
+                                    }).collect(),
+                                    created: validated_change.created.iter().map(|c| {
+                                        BoxEntry::new(
+                                            c.ergo_box.clone(),
+                                            height,
+                                            c.tx_id.clone(),
+                                            c.output_index,
+                                        )
+                                    }).collect(),
+                                };
 
                                 info!(
                                     height,
+                                    total_cost = validation_result.total_cost,
                                     spent = state_change.spent.len(),
                                     created = state_change.created.len(),
-                                    "Applying block to UTXO state"
+                                    "Block validated, applying to UTXO state"
                                 );
-
-                                // Create FullBlock (with empty extension for now - we'd need to fetch it separately)
-                                let extension = Extension::empty(header_id.clone());
-                                let full_block = FullBlock::new(header, block_txs, extension, None);
 
                                 // Apply block to state
                                 match state_for_router.apply_block(full_block, state_change) {
@@ -612,38 +767,51 @@ impl Node {
         peer_addresses: &HashMap<PeerId, SocketAddr>,
         peer_handshakes: &HashMap<PeerId, Handshake>,
         network_cmd_tx: &mpsc::Sender<NetworkCommand>,
+        discovered_peers: &mut std::collections::HashSet<SocketAddr>,
     ) {
         match message {
             Message::SyncInfo(sync_info) => {
                 debug!(peer = %peer_id, height = sync_info.last_headers.len(), "SyncInfo received");
-                let _ = sync_event_tx
-                    .send(SyncEvent::SyncInfoReceived {
+                // Use try_send to avoid deadlock - if channel is full, drop the event
+                if sync_event_tx
+                    .try_send(SyncEvent::SyncInfoReceived {
                         peer: peer_id.clone(),
                         info: sync_info,
                     })
-                    .await;
+                    .is_err()
+                {
+                    warn!("Sync event channel full, dropping SyncInfo");
+                }
             }
             Message::Inv(inv) => {
                 debug!(peer = %peer_id, count = inv.ids.len(), "Inv received");
-                let _ = sync_event_tx
-                    .send(SyncEvent::InvReceived {
+                if sync_event_tx
+                    .try_send(SyncEvent::InvReceived {
                         peer: peer_id.clone(),
                         inv,
                     })
-                    .await;
+                    .is_err()
+                {
+                    warn!("Sync event channel full, dropping Inv");
+                }
             }
             Message::Modifier(modifier) => {
                 debug!(peer = %peer_id, type_id = modifier.type_id, count = modifier.modifiers.len(), "Modifier received");
                 // Send an event for each modifier in the batch
+                // Use try_send to avoid deadlock
                 for item in modifier.modifiers {
-                    let _ = sync_event_tx
-                        .send(SyncEvent::ModifierReceived {
+                    if sync_event_tx
+                        .try_send(SyncEvent::ModifierReceived {
                             peer: peer_id.clone(),
                             type_id: modifier.type_id,
                             id: item.id,
                             data: item.data,
                         })
-                        .await;
+                        .is_err()
+                    {
+                        warn!("Sync event channel full, dropping Modifier");
+                        break; // Stop trying if channel is full
+                    }
                 }
             }
             Message::RequestModifier(request) => {
@@ -690,11 +858,28 @@ impl Node {
             }
             Message::Peers(peers) => {
                 info!(peer = %peer_id, count = peers.len(), "Peers received");
-                // Log the received peers - they can be used for future connections
+                // Store discovered peers for future connection attempts
+                let mut added_count = 0;
                 for peer_spec in &peers {
-                    info!(peer_spec = %peer_spec, "Received peer info");
+                    if let Some(declared_addr) = &peer_spec.declared_addr {
+                        let addr = SocketAddr::new(declared_addr.ip, declared_addr.port);
+                        // Don't add if we're already connected to this peer
+                        if !peer_addresses.values().any(|a| *a == addr) {
+                            // Don't add if already in discovered set
+                            if discovered_peers.insert(addr) {
+                                added_count += 1;
+                                debug!(addr = %addr, "Added discovered peer");
+                            }
+                        }
+                    }
                 }
-                // TODO: Add received peers to PeerManager for future connections
+                if added_count > 0 {
+                    info!(
+                        added = added_count,
+                        total_discovered = discovered_peers.len(),
+                        "Added new discovered peers"
+                    );
+                }
             }
             Message::Handshake(_) => {
                 // Handshake already handled by NetworkService

@@ -23,8 +23,10 @@ use blake2::{Blake2b, Digest};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-/// Header size: magic (4) + type (1) + length (4) + checksum (4) = 13 bytes
-const HEADER_SIZE: usize = 13;
+/// Base header size: magic (4) + type (1) + length (4) = 9 bytes
+/// Checksum (4 bytes) is only included when payload length > 0
+const BASE_HEADER_SIZE: usize = 9;
+const CHECKSUM_SIZE: usize = 4;
 
 /// Message codec for Ergo P2P protocol.
 pub struct MessageCodec {
@@ -77,8 +79,8 @@ impl Decoder for MessageCodec {
     type Error = NetworkError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // Need at least header size
-        if src.len() < HEADER_SIZE {
+        // Need at least base header size
+        if src.len() < BASE_HEADER_SIZE {
             return Ok(None);
         }
 
@@ -93,7 +95,6 @@ impl Decoder for MessageCodec {
 
         let msg_type = src[4];
         let length = u32::from_be_bytes([src[5], src[6], src[7], src[8]]) as usize;
-        let checksum: [u8; 4] = [src[9], src[10], src[11], src[12]];
 
         // Validate length
         if length > self.max_size {
@@ -103,26 +104,39 @@ impl Decoder for MessageCodec {
             });
         }
 
+        // Calculate total size - checksum only present when length > 0
+        let total_size = if length > 0 {
+            BASE_HEADER_SIZE + CHECKSUM_SIZE + length
+        } else {
+            BASE_HEADER_SIZE
+        };
+
         // Check if we have the full message
-        let total_size = HEADER_SIZE + length;
         if src.len() < total_size {
             // Reserve space for the full message
             src.reserve(total_size - src.len());
             return Ok(None);
         }
 
-        // Consume header
-        src.advance(HEADER_SIZE);
+        // Consume base header
+        src.advance(BASE_HEADER_SIZE);
 
-        // Get payload
-        let payload = src.split_to(length).freeze();
+        // Get payload (with checksum verification if length > 0)
+        let payload = if length > 0 {
+            let checksum: [u8; 4] = [src[0], src[1], src[2], src[3]];
+            src.advance(CHECKSUM_SIZE);
+            let payload = src.split_to(length).freeze();
 
-        // Verify checksum
-        if !Self::verify_checksum(&payload, &checksum) {
-            return Err(NetworkError::InvalidMessage(
-                "Checksum mismatch".to_string(),
-            ));
-        }
+            // Verify checksum
+            if !Self::verify_checksum(&payload, &checksum) {
+                return Err(NetworkError::InvalidMessage(
+                    "Checksum mismatch".to_string(),
+                ));
+            }
+            payload
+        } else {
+            Bytes::new()
+        };
 
         // Decode message from payload
         let mut msg_bytes = BytesMut::new();
@@ -159,20 +173,25 @@ impl Encoder<Message> for MessageCodec {
             });
         }
 
-        // Calculate checksum
-        let checksum = Self::checksum(payload);
+        // Reserve space - checksum only when length > 0
+        let total_size = if length > 0 {
+            BASE_HEADER_SIZE + CHECKSUM_SIZE + length
+        } else {
+            BASE_HEADER_SIZE
+        };
+        dst.reserve(total_size);
 
-        // Reserve space
-        dst.reserve(HEADER_SIZE + length);
-
-        // Write header
+        // Write base header
         dst.put_slice(&self.magic);
         dst.put_u8(msg_type);
         dst.put_u32(length as u32);
-        dst.put_slice(&checksum);
 
-        // Write payload
-        dst.put_slice(payload);
+        // Write checksum and payload only if length > 0
+        if length > 0 {
+            let checksum = Self::checksum(payload);
+            dst.put_slice(&checksum);
+            dst.put_slice(payload);
+        }
 
         Ok(())
     }

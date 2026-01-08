@@ -88,6 +88,10 @@ struct PendingHeader {
     parent_id: Vec<u8>,
 }
 
+/// Maximum number of headers to include in V2 SyncInfo.
+/// The Scala node uses `ErgoSyncInfo.MaxBlockIds = 10` for V2.
+const MAX_V2_HEADERS: usize = 10;
+
 /// Sync protocol handler.
 pub struct SyncProtocol {
     /// Synchronizer state.
@@ -108,8 +112,10 @@ pub struct SyncProtocol {
     command_tx: mpsc::Sender<SyncCommand>,
     /// Pending header IDs from Inv that we haven't requested yet.
     pending_header_inv: RwLock<VecDeque<Vec<u8>>>,
-    /// Header IDs we've requested but not yet received (in-flight).
-    in_flight_headers: RwLock<std::collections::HashSet<Vec<u8>>>,
+    /// Header IDs we've requested but not yet received (in-flight), with request timestamp.
+    in_flight_headers: RwLock<HashMap<Vec<u8>, std::time::Instant>>,
+    /// Header request timeout duration.
+    header_timeout: std::time::Duration,
 }
 
 /// Per-peer sync state.
@@ -188,7 +194,8 @@ impl SyncProtocol {
             stored_headers: RwLock::new(stored),
             command_tx,
             pending_header_inv: RwLock::new(VecDeque::new()),
-            in_flight_headers: RwLock::new(std::collections::HashSet::new()),
+            in_flight_headers: RwLock::new(HashMap::new()),
+            header_timeout: std::time::Duration::from_secs(10),
         }
     }
 
@@ -199,33 +206,50 @@ impl SyncProtocol {
 
     /// Initialize with stored headers from database.
     /// This should be called before starting sync if we have previously synced headers.
-    pub fn init_from_stored_headers(&self, header_ids: Vec<Vec<u8>>) {
-        if header_ids.is_empty() {
+    ///
+    /// # Arguments
+    /// * `all_header_ids` - All stored header IDs (for tracking which headers we have)
+    /// * `locator_ids` - Exponentially spaced header IDs for SyncInfo messages
+    /// * `recent_headers` - Most recent headers (for V2 SyncInfo) - should be the last MAX_V2_HEADERS
+    pub fn init_from_stored_headers(
+        &self,
+        all_header_ids: Vec<Vec<u8>>,
+        locator_ids: Vec<Vec<u8>>,
+        recent_headers: Vec<Header>,
+    ) {
+        if all_header_ids.is_empty() {
             return;
         }
 
         info!(
-            "Initializing sync protocol with {} stored headers",
-            header_ids.len()
+            "Initializing sync protocol with {} stored headers, {} locator headers, {} recent headers for V2",
+            all_header_ids.len(),
+            locator_ids.len(),
+            recent_headers.len()
         );
 
-        // Add all header IDs to stored set
+        // Add all header IDs to stored set (for tracking what we already have)
         {
             let mut stored = self.stored_headers.write();
-            for id in &header_ids {
-                stored.insert(id.clone());
+            for id in all_header_ids {
+                stored.insert(id);
             }
         }
 
-        // Set our best headers (last N for SyncInfo)
-        // Take the most recent ones (they should be in order from genesis to tip)
-        let best_headers: Vec<Vec<u8>> = header_ids
-            .into_iter()
-            .rev()
-            .take(MAX_SYNC_HEADER_IDS)
-            .collect();
+        // Set our best headers for SyncInfo (exponentially spaced locator)
+        *self.our_best_headers.write() = locator_ids;
 
-        *self.our_best_headers.write() = best_headers;
+        // Add recent headers to header_chain for V2 SyncInfo
+        if !recent_headers.is_empty() {
+            let mut chain = self.header_chain.write();
+            for header in recent_headers {
+                chain.headers.push_back(header);
+            }
+            info!(
+                "Added {} headers to header_chain for V2 SyncInfo",
+                chain.headers.len()
+            );
+        }
     }
 
     /// Get the downloader.
@@ -281,7 +305,7 @@ impl SyncProtocol {
 
     /// Handle new peer connection.
     async fn on_peer_connected(&self, peer: PeerId) -> SyncResult<()> {
-        info!(peer = %peer, "Peer connected, sending SyncInfo");
+        info!(peer = %peer, "Peer connected, sending SyncInfo V2");
 
         // Add to sync peers with initial state
         let mut state = PeerSyncState::new();
@@ -290,39 +314,73 @@ impl SyncProtocol {
 
         self.sync_peers.write().insert(peer.clone(), state);
 
-        // Send our SyncInfo (V1 format with header IDs)
-        // Limit to MAX_SYNC_HEADER_IDS to avoid overwhelming the peer
-        // Scala node typically sends ~100 IDs sampled from the chain
-        let our_headers: Vec<Vec<u8>> = self
-            .our_best_headers
-            .read()
-            .iter()
-            .rev() // Most recent first
-            .take(MAX_SYNC_HEADER_IDS)
-            .cloned()
-            .collect();
+        // Send V2 SyncInfo with serialized headers so the peer knows our height
+        // and will respond with V2 SyncInfo containing their height
+        //
+        // V2 SyncInfo contains full serialized headers which include height.
+        // The Scala node checks if we sent V2 first before responding with V2.
+        let sync_info = self.build_v2_sync_info();
 
-        // Always send SyncInfo - if we have no headers, send genesis ID
-        // This tells the peer "I'm starting from genesis, please send me headers"
-        let sync_headers = if !our_headers.is_empty() {
-            debug!(
-                "Initial SyncInfo: count={}, first_len={}",
-                our_headers.len(),
-                our_headers.first().map(|v| v.len()).unwrap_or(0)
+        if sync_info.is_v2() {
+            info!(
+                header_count = sync_info.last_headers.len(),
+                "Sending SyncInfo V2 with serialized headers"
             );
-            our_headers
         } else {
-            // Fresh node - send genesis block ID (all zeros) to signal we need headers from the start
-            // The genesis block at height=0 has ID = 0000...0000
-            let genesis_id = vec![0u8; 32];
-            info!("Fresh node - sending genesis ID (all zeros) in SyncInfo to request headers");
-            vec![genesis_id]
-        };
+            info!(
+                id_count = sync_info.last_header_ids.len(),
+                "Sending SyncInfo V1 (no headers to serialize yet)"
+            );
+        }
 
-        let sync_info = SyncInfo::v1(sync_headers);
         self.send_to_peer(&peer, Message::SyncInfo(sync_info))
             .await?;
         Ok(())
+    }
+
+    /// Build a V2 SyncInfo with serialized headers.
+    /// Falls back to V1 with genesis ID if we have no headers yet.
+    fn build_v2_sync_info(&self) -> SyncInfo {
+        // Get headers from our chain (oldest first ordering in header_chain.headers)
+        let chain = self.header_chain.read();
+
+        if !chain.headers.is_empty() {
+            // Get the last MAX_V2_HEADERS headers (most recent)
+            // header_chain.headers is in oldest-first order (push_back)
+            let headers: Vec<_> = chain.headers.iter().collect();
+            let start = headers.len().saturating_sub(MAX_V2_HEADERS);
+
+            // Serialize headers for V2 format
+            // V2 expects [oldest, ..., newest] order, which is already our order
+            let serialized_headers: Vec<Vec<u8>> = headers[start..]
+                .iter()
+                .filter_map(|h| {
+                    match h.scorex_serialize_bytes() {
+                        Ok(bytes) => Some(bytes),
+                        Err(e) => {
+                            warn!(height = h.height, error = ?e, "Failed to serialize header for V2 SyncInfo");
+                            None
+                        }
+                    }
+                })
+                .collect();
+
+            if !serialized_headers.is_empty() {
+                info!(
+                    header_count = serialized_headers.len(),
+                    first_height = headers[start].height,
+                    last_height = headers.last().map(|h| h.height).unwrap_or(0),
+                    "Built V2 SyncInfo with serialized headers"
+                );
+                return SyncInfo::v2(serialized_headers);
+            }
+        }
+
+        // No headers yet - send V1 with genesis ID
+        // The genesis block at height=0 has ID = 0000...0000
+        let genesis_id = vec![0u8; 32];
+        info!("No headers to serialize - sending V1 SyncInfo with genesis ID");
+        SyncInfo::v1(vec![genesis_id])
     }
 
     /// Handle peer disconnection.
@@ -416,31 +474,19 @@ impl SyncProtocol {
             );
         }
 
-        // Respond with our SyncInfo so the peer knows what headers we have
-        // This allows them to send us an Inv with the headers we need
-        let our_headers: Vec<Vec<u8>> = self
-            .our_best_headers
-            .read()
-            .iter()
-            .take(MAX_SYNC_HEADER_IDS)
-            .cloned()
-            .collect();
+        // Respond with V2 SyncInfo so the peer knows our height
+        // This ensures they respond with V2 as well, giving us their height
+        let sync_info = self.build_v2_sync_info();
 
-        // Always respond - use genesis ID if we have no headers
-        let response_headers = if !our_headers.is_empty() {
+        if sync_info.is_v2() {
             debug!(
-                "Responding to SyncInfo with our {} headers",
-                our_headers.len()
+                "Responding to SyncInfo with V2 ({} headers)",
+                sync_info.last_headers.len()
             );
-            our_headers
         } else {
-            // Fresh node - send genesis block ID (all zeros)
-            let genesis_id = vec![0u8; 32];
-            debug!("Responding to SyncInfo with genesis ID (fresh node)");
-            vec![genesis_id]
-        };
+            debug!("Responding to SyncInfo with V1 (no headers yet)");
+        }
 
-        let sync_info = SyncInfo::v1(response_headers);
         self.send_to_peer(&peer, Message::SyncInfo(sync_info))
             .await?;
 
@@ -470,13 +516,35 @@ impl SyncProtocol {
             }
 
             // Filter out already-stored headers
-            let filtered_ids: Vec<Vec<u8>> = {
+            let original_count = inv.ids.len();
+            let (filtered_ids, removed_ids): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
                 let stored = self.stored_headers.read();
-                inv.ids
-                    .into_iter()
-                    .filter(|id| !stored.contains(id))
-                    .collect()
+                let mut filtered = Vec::new();
+                let mut removed = Vec::new();
+                for id in inv.ids {
+                    if stored.contains(&id) {
+                        removed.push(id);
+                    } else {
+                        filtered.push(id);
+                    }
+                }
+                (filtered, removed)
             };
+
+            // Log removed IDs for debugging
+            for removed_id in &removed_ids {
+                info!(
+                    removed_id = %hex::encode(removed_id),
+                    "Filtered out header ID (already stored)"
+                );
+            }
+
+            info!(
+                original = original_count,
+                filtered = filtered_ids.len(),
+                removed = removed_ids.len(),
+                "Filtered Inv IDs"
+            );
 
             let mut ids_iter = filtered_ids.into_iter();
 
@@ -501,9 +569,10 @@ impl SyncProtocol {
             if !ids_to_request.is_empty() {
                 // Track these as in-flight before sending request
                 if is_header_inv {
+                    let now = std::time::Instant::now();
                     let mut in_flight = self.in_flight_headers.write();
                     for id in &ids_to_request {
-                        in_flight.insert(id.clone());
+                        in_flight.insert(id.clone(), now);
                     }
                     drop(in_flight);
                 }
@@ -582,12 +651,29 @@ impl SyncProtocol {
         id: Vec<u8>,
         data: Vec<u8>,
     ) -> SyncResult<()> {
+        info!(
+            id = hex::encode(&id),
+            data_len = data.len(),
+            "on_header_received called"
+        );
+
         // Remove from in-flight tracking
         self.in_flight_headers.write().remove(&id);
 
         // Parse header using sigma-rust
         let header = match Header::scorex_parse_bytes(&data) {
-            Ok(h) => h,
+            Ok(h) => {
+                // Log all parsed headers for debugging
+                let actual_id = h.id.0.as_ref();
+                info!(
+                    height = h.height,
+                    msg_id = hex::encode(&id),
+                    actual_id = hex::encode(actual_id),
+                    id_match = (id == actual_id),
+                    "Parsed header"
+                );
+                h
+            }
             Err(e) => {
                 warn!("Failed to parse header: {}", e);
                 return Err(SyncError::InvalidData(format!(
@@ -597,50 +683,69 @@ impl SyncProtocol {
             }
         };
 
-        // Update peer height if this header is higher than what we've seen
-        // This gives us a more accurate peer height than the V1 SyncInfo estimate
-        let update_height = {
-            let mut peers = self.sync_peers.write();
-            if let Some(state) = peers.get_mut(peer) {
-                if header.height > state.height {
-                    state.height = header.height;
-                    Some(header.height)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(height) = update_height {
-            self.synchronizer.set_peer_height(peer.clone(), height);
-        }
+        // Note: We intentionally do NOT update peer_height from received headers.
+        // With V1 SyncInfo, we don't know the peer's actual height - they could have
+        // millions more headers. Setting peer_height to received header height would
+        // make us think we're caught up when we're not. Instead, we keep sending
+        // SyncInfo periodically to discover more headers.
 
         let parent_id = header.parent_id.0.as_ref().to_vec();
 
-        // Check if we already have this header
+        // Check if we already have this header (in our in-memory tracking)
         let already_stored = self.stored_headers.read().contains(&id);
         if already_stored {
-            trace!(height = header.height, "Header already stored, skipping");
+            // Log at info level for first few headers to diagnose restart behavior
+            if header.height <= 5 || header.height % 100 == 0 {
+                info!(
+                    height = header.height,
+                    "Header already in stored_headers, skipping"
+                );
+            }
             return Ok(());
         }
 
         // Check if parent is available (either genesis or already stored)
         let parent_available = self.stored_headers.read().contains(&parent_id);
 
+        // Log for first few headers to diagnose, or for any header around the sync point
+        if header.height <= 5 || (header.height >= 3130 && header.height <= 3140) {
+            info!(
+                height = header.height,
+                parent = hex::encode(&parent_id),
+                parent_available,
+                stored_count = self.stored_headers.read().len(),
+                "Processing header - checking parent"
+            );
+        }
+
         if parent_available {
             // Parent exists, we can store this header
+            info!(height = header.height, "Storing header - parent available");
             self.store_header_and_descendants(header).await?;
         } else {
             // Parent not available yet, buffer this header
-            debug!(
-                height = header.height,
-                parent = hex::encode(&parent_id),
-                "Buffering header - parent not available"
-            );
-            self.pending_headers
-                .write()
-                .insert(id.clone(), PendingHeader { header, parent_id });
+            let pending_count = {
+                let mut pending = self.pending_headers.write();
+                pending.insert(
+                    id.clone(),
+                    PendingHeader {
+                        header: header.clone(),
+                        parent_id: parent_id.clone(),
+                    },
+                );
+                pending.len()
+            };
+
+            // Log periodically to show buffering is happening
+            if pending_count % 50 == 1 || header.height <= 5 {
+                info!(
+                    height = header.height,
+                    parent = hex::encode(&parent_id),
+                    pending_count,
+                    stored_count = self.stored_headers.read().len(),
+                    "Buffering header - parent not available"
+                );
+            }
         }
 
         Ok(())
@@ -730,12 +835,37 @@ impl SyncProtocol {
         // Find headers waiting for this parent
         let waiting: Vec<_> = {
             let pending = self.pending_headers.read();
-            pending
+            let waiting: Vec<_> = pending
                 .iter()
                 .filter(|(_, ph)| ph.parent_id == parent_id)
                 .map(|(id, ph)| (id.clone(), ph.header.clone()))
-                .collect()
+                .collect();
+
+            if waiting.is_empty() && !pending.is_empty() {
+                // Log for debugging - show first few pending parents
+                let sample_parents: Vec<_> = pending
+                    .iter()
+                    .take(3)
+                    .map(|(_, ph)| (ph.header.height, hex::encode(&ph.parent_id)))
+                    .collect();
+                info!(
+                    parent_id = hex::encode(parent_id),
+                    pending_count = pending.len(),
+                    ?sample_parents,
+                    "No pending headers waiting for this parent"
+                );
+            }
+
+            waiting
         };
+
+        if !waiting.is_empty() {
+            info!(
+                parent_id = hex::encode(parent_id),
+                waiting_count = waiting.len(),
+                "Found pending headers to apply"
+            );
+        }
 
         // Apply each waiting header
         for (id, header) in waiting {
@@ -870,11 +1000,37 @@ impl SyncProtocol {
 
     /// Periodic tick handler.
     async fn on_tick(&self) -> SyncResult<()> {
-        // Check for timeouts
+        // Check for block download timeouts
         let timed_out = self.downloader.check_timeouts();
         for (id, peer) in timed_out {
-            warn!(id = hex::encode(&id), peer = %peer, "Download timed out");
+            warn!(id = hex::encode(&id), peer = %peer, "Block download timed out");
             self.downloader.fail(&id, &peer);
+        }
+
+        // Check for header request timeouts and re-queue them
+        let header_timeout = self.header_timeout;
+        let timed_out_headers: Vec<Vec<u8>> = {
+            let in_flight = self.in_flight_headers.read();
+            in_flight
+                .iter()
+                .filter(|(_, requested_at)| requested_at.elapsed() > header_timeout)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+
+        if !timed_out_headers.is_empty() {
+            warn!(
+                count = timed_out_headers.len(),
+                "Header requests timed out, re-queuing for retry"
+            );
+            // Remove from in-flight and add back to pending queue for retry
+            let mut in_flight = self.in_flight_headers.write();
+            let mut pending = self.pending_header_inv.write();
+            for id in timed_out_headers {
+                in_flight.remove(&id);
+                // Re-queue at front for faster retry
+                pending.push_front(id);
+            }
         }
 
         // Queue block downloads if we have headers but no pending block downloads
@@ -934,7 +1090,10 @@ impl SyncProtocol {
         // During initial header sync, don't download blocks yet
         // Only start downloading blocks when we're within 1000 headers of the tip
         // This implements header-first sync strategy
-        if peer_height > 0 && our_height + 1000 < peer_height {
+        //
+        // Also skip if peer_height is 0 (unknown) - we're still discovering the chain
+        // With V1 SyncInfo we don't know the peer's actual height, so be conservative
+        if peer_height == 0 || our_height + 1000 < peer_height {
             // Still syncing headers, skip block downloads for now
             return;
         }
@@ -976,30 +1135,49 @@ impl SyncProtocol {
         let pending_inv_count = self.pending_header_inv.read().len();
         let in_flight_count = self.in_flight_headers.read().len();
 
-        debug!(
+        let has_peers_with_headers_check = self
+            .sync_peers
+            .read()
+            .values()
+            .any(|s| !s.best_headers.is_empty());
+
+        // Tick counter for debugging (static so it persists across calls)
+        static REQ_TICK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tick_num = REQ_TICK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        info!(
+            tick_num,
             our_height,
             peer_height,
             chain_len,
             pending_inv_count,
             in_flight_count,
-            "request_more_headers check"
+            pending_headers = self.pending_headers.read().len(),
+            has_peers_with_headers = has_peers_with_headers_check,
+            "request_more_headers tick"
         );
 
-        // Don't request more if we still have headers in flight
-        if in_flight_count > 0 {
-            debug!(in_flight_count, "Waiting for in-flight headers to complete");
+        // Don't request more headers if we have enough in flight
+        // (timeouts are handled separately in on_tick via header_timeout)
+        if in_flight_count > 50 {
+            debug!(
+                in_flight_count,
+                "Enough headers in flight, waiting for responses"
+            );
             return Ok(());
         }
 
         // If we have pending headers, check if we should clear them
         // (they might be stuck because we received non-consecutive headers)
+        // But DON'T clear them if we have stored headers (restart case)
         let pending_count = self.pending_headers.read().len();
-        if pending_count > 0 {
-            // Clear pending headers if they've been stuck
+        let stored_count = self.stored_headers.read().len();
+        if pending_count > 0 && stored_count == 0 {
+            // Clear pending headers only if we're truly a fresh node with no stored headers
             // (they were probably from non-consecutive SyncInfo samples)
-            if pending_count > 0 && self.header_chain.read().headers.is_empty() {
-                // We have pending but no applied headers - clear the pending ones
-                warn!(pending_count, "Clearing stuck pending headers");
+            if self.header_chain.read().headers.is_empty() {
+                // We have pending but no applied headers and no stored headers - clear the pending ones
+                warn!(pending_count, "Clearing stuck pending headers (fresh node)");
                 self.pending_headers.write().clear();
             }
         }
@@ -1032,11 +1210,12 @@ impl SyncProtocol {
                         "Requesting pending headers from Inv queue (tick)"
                     );
 
-                    // Track as in-flight
+                    // Track as in-flight with timestamp
                     {
+                        let now = std::time::Instant::now();
                         let mut in_flight = self.in_flight_headers.write();
                         for id in &pending_ids {
-                            in_flight.insert(id.clone());
+                            in_flight.insert(id.clone(), now);
                         }
                     }
 
@@ -1056,49 +1235,30 @@ impl SyncProtocol {
             return Ok(());
         }
 
-        // If we're behind the network and have no pending Inv, send SyncInfo
-        // Also send if peer_height is 0 but peer has announced headers (V1 SyncInfo case)
-        let has_peers_with_headers = self
-            .sync_peers
-            .read()
-            .values()
-            .any(|s| !s.best_headers.is_empty());
+        // Periodically send SyncInfo to discover more headers
+        // We need to keep sending even when our_height == peer_height because:
+        // 1. peer_height is just an estimate based on headers we received
+        // 2. The peer may have many more headers we haven't discovered yet
+        // 3. With V1 SyncInfo, we don't get the actual peer height
+        let has_peers = !self.sync_peers.read().is_empty();
 
-        if our_height < peer_height || (peer_height == 0 && has_peers_with_headers) {
+        // Send SyncInfo if we have peers and either:
+        // - We're behind the peer (our_height < peer_height)
+        // - We have no pending work (to discover more headers)
+        // - Every 10 ticks as a heartbeat to check for new headers
+        static SYNC_TICK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sync_tick = SYNC_TICK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let should_send_sync = has_peers
+            && (our_height < peer_height
+                || peer_height == 0
+                || (pending_inv_count == 0 && in_flight_count == 0 && sync_tick % 5 == 0));
+
+        if should_send_sync {
             // Find a peer that we can send SyncInfo to (respecting rate limits)
             if let Some(peer) = self.find_peer_for_sync() {
-                // Get our best header IDs for SyncInfo
-                let our_best_ids: Vec<Vec<u8>> = {
-                    let chain = self.header_chain.read();
-                    chain
-                        .headers
-                        .iter()
-                        .rev()
-                        .take(10)
-                        .map(|h| h.id.0.as_ref().to_vec())
-                        .collect()
-                };
-
-                // Use genesis ID if we have no headers yet
-                let sync_ids = if !our_best_ids.is_empty() {
-                    our_best_ids
-                } else {
-                    // Fresh node - send genesis block ID (all zeros)
-                    let genesis_id = vec![0u8; 32];
-                    info!("Fresh node tick - sending genesis ID (all zeros) in SyncInfo");
-                    vec![genesis_id]
-                };
-
-                // Log the IDs we're sending for debugging
-                debug!(
-                    "SyncInfo IDs: count={}, first_len={}, first_hex={}",
-                    sync_ids.len(),
-                    sync_ids.first().map(|v| v.len()).unwrap_or(0),
-                    sync_ids.first().map(|v| hex::encode(v)).unwrap_or_default()
-                );
                 info!(
                     our_height,
-                    peer_height, chain_len, "Sending SyncInfo to request more headers"
+                    peer_height, chain_len, "Sending SyncInfo V2 to request more headers"
                 );
 
                 // Update last sync time
@@ -1106,11 +1266,9 @@ impl SyncProtocol {
                     state.last_sync_sent = std::time::Instant::now();
                 }
 
-                // Update our tracked best headers
-                *self.our_best_headers.write() = sync_ids.clone();
-
-                // Send SyncInfo to trigger the peer to send us Inv with more headers
-                let sync_info = SyncInfo::v1(sync_ids);
+                // Send V2 SyncInfo with serialized headers
+                // This ensures peer responds with V2 containing their height
+                let sync_info = self.build_v2_sync_info();
                 self.send_to_peer(&peer, Message::SyncInfo(sync_info))
                     .await?;
             }

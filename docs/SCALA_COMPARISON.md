@@ -4,7 +4,7 @@
 
 This document compares the Rust implementation with the Scala reference implementation to identify gaps and guide further development.
 
-**Last Updated:** January 7, 2025
+**Last Updated:** January 8, 2025
 
 ## Component-by-Component Comparison
 
@@ -18,12 +18,17 @@ This document compares the Rust implementation with the Scala reference implemen
 | Peer Management | Actor-based | DashMap + channels | COMPLETE |
 | Peer Scoring | Complex scoring | Basic scoring | PARTIAL |
 | Peer Discovery | DNS + exchange | Known peers + exchange | PARTIAL |
-| Rate Limiting | Per-message throttle | SyncInfo + request limits | COMPLETE |
+| Rate Limiting | Per-message throttle | Matches Scala params (400/100ms) | COMPLETE |
 | Connection Pool | Configurable limits | Configurable limits | COMPLETE |
 
 **Gaps:**
 - DNS seed discovery not implemented
 - Peer scoring could be more sophisticated
+
+**Recent Fixes (January 8, 2025):**
+- Fixed genesis ID handling (must be all-zeros for height=0)
+- Optimized rate limits to match Scala: MAX_REQUEST_SIZE=400, MIN_REQUEST_INTERVAL=100ms
+- Header sync verified working at ~17 headers/second
 
 ### 2. Sync Protocol
 
@@ -33,7 +38,7 @@ This document compares the Rust implementation with the Scala reference implemen
 | SyncInfo V1 (IDs) | Yes | Yes | COMPLETE |
 | SyncInfo V2 (Headers) | Yes | Parse TODO | PARTIAL |
 | Inv handling | Full | Full | COMPLETE |
-| Modifier requests | Batched | Batched (50) | COMPLETE |
+| Modifier requests | Batched (400) | Batched (400) | COMPLETE |
 | Block download | Parallel | Parallel (16) | COMPLETE |
 | Download timeout | Configurable | 30s default | COMPLETE |
 | Chain reorganization | Full support | Cumulative difficulty | COMPLETE |

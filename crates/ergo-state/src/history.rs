@@ -403,6 +403,12 @@ impl History {
         let height = header.height;
         let n_bits = header.n_bits;
 
+        // Check if we already have this header (idempotent operation)
+        if self.headers.contains(&header_id)? {
+            info!(height, id = %header_id, "Header already exists in database, skipping");
+            return Ok(ChainSelection::Ignored);
+        }
+
         // Check parent exists (except for genesis and first block after genesis)
         // Genesis is at height=1, so height=2 headers have genesis as parent which isn't stored
         if height > 2 && !self.headers.contains(&parent_id)? {

@@ -6,7 +6,7 @@ A Rust implementation of the Ergo blockchain node with feature parity to the [Sc
 
 ### Completed
 - **P2P Networking**: Full handshake protocol, message framing, peer management
-- **Sync Protocol**: Header-first sync, block download, inventory handling
+- **Sync Protocol**: Header-first sync, block download, inventory handling (rate limits match Scala node)
 - **PoW Verification**: Autolykos v2 verification with difficulty adjustment
 - **Block Validation**: Merkle root verification, header validation
 - **Transaction Validation**: Input/data-input existence, script execution, token/ERG conservation
@@ -24,6 +24,7 @@ A Rust implementation of the Ergo blockchain node with feature parity to the [Sc
 
 ### In Progress
 - Full block synchronization testing
+- Header sync verified working (~17 headers/sec with mainnet nodes)
 
 ### Planned
 - NiPoPoW bootstrap
@@ -235,6 +236,33 @@ pre_generate = 20
 ```
 
 ## Development Guidelines
+
+### ⚠️ CRITICAL: Serialization Compatibility with Scala Node
+
+**ALWAYS check the Scala node source code in detail before implementing or modifying any serialization code.**
+
+The Rust node MUST produce byte-identical serialization to the Scala node. Incorrect serialization will cause peers to reject connections or blacklist the node.
+
+**Key serialization files in the Scala node** (located at `/home/luivatra/develop/ergo/ergo`):
+- `ergo-core/src/main/scala/org/ergoplatform/network/message/` - Message specs (InvSpec, ModifiersSpec, etc.)
+- `src/main/scala/org/ergoplatform/network/message/MessageSerializer.scala` - Message framing
+- `src/main/scala/org/ergoplatform/network/message/BasicMessagesRepo.scala` - GetPeers, Peers, Snapshots
+- `ergo-core/src/main/scala/org/ergoplatform/network/HandshakeSerializer.scala` - Handshake protocol
+- `ergo-core/src/main/scala/org/ergoplatform/network/message/SyncInfoMessageSpec.scala` - SyncInfo V1/V2
+
+**Common serialization pitfalls to verify:**
+1. **VLQ vs fixed-width integers**: Scala uses VLQ (Variable Length Quantity) encoding for many integers via `putUInt`, `putUShort`, etc. Check if the Scala code uses `Writer.putInt` (VLQ) vs `ByteString.putInt` (fixed 4-byte big-endian).
+2. **Message framing**: Checksum is only included when payload length > 0. Empty messages (like GetPeers) have no checksum.
+3. **Message codes**: Must match exactly (GetPeers=1, Peers=2, RequestModifier=22, Modifier=33, Inv=55, SyncInfo=65, Handshake=75, etc.)
+4. **String encoding**: Usually VLQ length prefix + UTF-8 bytes
+5. **Optional fields**: Check how None/Some are encoded
+6. **Collection encoding**: Usually VLQ count + elements
+
+**Before implementing any P2P message serialization:**
+1. Find the corresponding `MessageSpec` in the Scala code
+2. Read the `serialize` and `parse` methods carefully
+3. Check what `Writer`/`Reader` methods are used (VLQ vs fixed-width)
+4. Write tests that verify byte-for-byte compatibility
 
 ### Code Style
 

@@ -6,9 +6,14 @@ This document outlines the implementation plan for the Ergo Rust Node, a full bl
 
 ## Current Status
 
-**Last Updated:** January 7, 2025
+**Last Updated:** January 8, 2025
 
-The project has completed Phases 1-9 (Core Infrastructure through Wallet). Header synchronization is working with real Ergo mainnet nodes. Mining and wallet functionality are fully implemented.
+The project has completed Phases 1-9 (Core Infrastructure through Wallet). Header synchronization is working with real Ergo mainnet nodes at ~17 headers/second. Mining and wallet functionality are fully implemented.
+
+**Recent Fixes (January 8, 2025):**
+- Fixed genesis ID handling (genesis block has all-zeros ID, not height=1 block ID)
+- Optimized sync rate limits to match Scala node parameters (MAX_REQUEST_SIZE=400, MIN_REQUEST_INTERVAL=100ms)
+- Verified header sync working: 791 headers synced in ~45 seconds
 
 | Crate | Status | Description |
 |-------|--------|-------------|
@@ -120,9 +125,10 @@ The project has completed Phases 1-9 (Core Infrastructure through Wallet). Heade
   - SyncCommand generation (SendToPeer, Broadcast, ApplyBlock)
   - Integration with Synchronizer and BlockDownloader
   - **Continuous sync loop**: SyncInfo -> Inv -> Headers -> SyncInfo
-  - **Rate limiting**: 20s between SyncInfo, 100ms between requests
-  - **Pending Inv queue**: Batches header requests (50 at a time)
+  - **Rate limiting**: 20s between SyncInfo, 100ms between requests (matches Scala node)
+  - **Batch requests**: 400 headers at a time (matching Scala's desiredInvObjects)
   - Header storage with parent validation
+  - **Genesis handling**: Correct all-zeros genesis ID (height=0 parent)
 
 - [x] **Block Download Scheduler** (`ergo-sync/src/download.rs`)
   - BlockDownloader with parallel download support
@@ -306,7 +312,8 @@ Note: Handler implementations need completion for full Scala node compatibility.
 | Transaction validation | < 10ms | TBD |
 | State lookup | < 1ms | TBD |
 | API response | < 50ms | TBD |
-| Sync speed | > 100 blocks/sec | TBD |
+| Header sync speed | > 100 headers/sec | ~17 headers/sec |
+| Block sync speed | > 100 blocks/sec | TBD |
 | Memory (full node) | < 4GB | TBD |
 
 ---

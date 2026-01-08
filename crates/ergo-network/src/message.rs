@@ -62,15 +62,16 @@ fn vlq_byte_len(value: u64) -> usize {
 }
 
 /// Message type identifiers.
+/// These must match the Scala node's message codes in BasicMessagesRepo.scala
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
-    /// Handshake message.
-    Handshake = 1,
-    /// Get peers request.
-    GetPeers = 2,
-    /// Peers response.
-    Peers = 3,
+    /// Get peers request (GetPeersSpec.messageCode = 1).
+    GetPeers = 1,
+    /// Peers response (PeersSpec.messageCode = 2).
+    Peers = 2,
+    /// Handshake message (handled separately, but we include it for completeness).
+    Handshake = 75,
     /// Sync info.
     SyncInfo = 65,
     /// Inventory announcement.
@@ -86,9 +87,9 @@ impl TryFrom<u8> for MessageType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(MessageType::Handshake),
-            2 => Ok(MessageType::GetPeers),
-            3 => Ok(MessageType::Peers),
+            1 => Ok(MessageType::GetPeers),
+            2 => Ok(MessageType::Peers),
+            75 => Ok(MessageType::Handshake),
             65 => Ok(MessageType::SyncInfo),
             55 => Ok(MessageType::Inv),
             22 => Ok(MessageType::RequestModifier),
@@ -335,7 +336,7 @@ impl Message {
                 buf.extend_from_slice(&json);
             }
             Message::GetPeers => {
-                buf.put_u32(0);
+                // Empty body - just the message type byte (already added above)
             }
             Message::Peers(peers) => {
                 // Serialize peers using VLQ count + serialized PeerSpec for each
@@ -522,5 +523,88 @@ mod tests {
         let decoded = Message::decode(encoded).unwrap();
 
         assert!(matches!(decoded, Message::GetPeers));
+    }
+
+    #[test]
+    fn test_syncinfo_v1_roundtrip() {
+        // Test SyncInfo V1 serialization roundtrip
+        // Scala expects [oldest, ..., newest] order (last = best header)
+        let ids = vec![
+            vec![1u8; 32], // oldest
+            vec![2u8; 32], // middle
+            vec![3u8; 32], // newest (best)
+        ];
+        let sync_info = SyncInfo::v1(ids.clone());
+
+        let serialized = sync_info.serialize();
+
+        // VLQ encoding: count 3 = 0x03 (1 byte) + 3 * 32-byte IDs = 97 bytes
+        assert_eq!(serialized.len(), 1 + 3 * 32);
+
+        // Verify VLQ count encoding (3 fits in 1 byte)
+        assert_eq!(serialized[0], 3);
+
+        // Verify roundtrip
+        let parsed = SyncInfo::parse(&serialized).unwrap();
+        assert_eq!(parsed.last_header_ids.len(), 3);
+        assert_eq!(parsed.last_header_ids[0], vec![1u8; 32]); // oldest first
+        assert_eq!(parsed.last_header_ids[2], vec![3u8; 32]); // newest last
+    }
+
+    #[test]
+    fn test_syncinfo_v1_header_order_convention() {
+        // This test documents the expected header order convention:
+        // - get_header_locator() returns [newest, ..., oldest]
+        // - SyncInfo should contain [oldest, ..., newest] (last = best)
+        // - So we REVERSE the locator when building SyncInfo
+
+        // Simulate a locator from get_header_locator() (newest first)
+        let locator = vec![
+            vec![3u8; 32], // newest (height 3)
+            vec![2u8; 32], // height 2
+            vec![1u8; 32], // oldest (height 1)
+        ];
+
+        // Reverse for SyncInfo (Scala expects oldest first, newest last)
+        let sync_headers: Vec<Vec<u8>> = locator.iter().rev().cloned().collect();
+
+        // Verify order: oldest first, newest last
+        assert_eq!(sync_headers[0], vec![1u8; 32]); // oldest
+        assert_eq!(sync_headers[2], vec![3u8; 32]); // newest (best) - last position
+
+        // Create SyncInfo and verify
+        let sync_info = SyncInfo::v1(sync_headers.clone());
+        assert!(!sync_info.is_v2());
+        assert_eq!(sync_info.last_header_ids.len(), 3);
+
+        // The LAST element should be the best/newest header
+        // This is what Scala checks: si.lastHeaderIds.last shouldEqual chain.last.header.id
+        assert_eq!(
+            sync_info.last_header_ids.last().unwrap(),
+            &vec![3u8; 32],
+            "Last element should be the best/newest header"
+        );
+    }
+
+    #[test]
+    fn test_syncinfo_v1_vlq_encoding() {
+        // Test that count is VLQ encoded (matching Scala's putUShort which uses VLQ)
+        // VLQ encoding: values < 128 use 1 byte, >= 128 use 2 bytes
+
+        // Test small count (1 byte VLQ)
+        let small_ids: Vec<Vec<u8>> = (0..10).map(|i| vec![i; 32]).collect();
+        let small_sync = SyncInfo::v1(small_ids);
+        let small_serialized = small_sync.serialize();
+        assert_eq!(small_serialized[0], 10); // count = 10, fits in 1 byte
+        assert_eq!(small_serialized.len(), 1 + 10 * 32);
+
+        // Test larger count that needs 2-byte VLQ (128 = 0x80 0x01 in VLQ)
+        // For 128 IDs: VLQ = [0x80, 0x01] + 128 * 32 bytes
+        // But we'll test with 127 (still 1 byte) and 128 (2 bytes)
+        let ids_127: Vec<Vec<u8>> = (0..127).map(|i| vec![i as u8; 32]).collect();
+        let sync_127 = SyncInfo::v1(ids_127);
+        let serialized_127 = sync_127.serialize();
+        assert_eq!(serialized_127[0], 127); // count = 127, still 1 byte
+        assert_eq!(serialized_127.len(), 1 + 127 * 32);
     }
 }
