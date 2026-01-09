@@ -13,6 +13,7 @@ ergo-network.workspace = true
 ergo-consensus.workspace = true
 ergo-mining.workspace = true
 ergo-wallet.workspace = true
+ergo-storage.workspace = true
 
 # sigma-rust
 ergo-lib.workspace = true

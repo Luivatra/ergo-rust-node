@@ -4,6 +4,7 @@ use ergo_mempool::Mempool;
 use ergo_mining::CandidateGenerator;
 use ergo_network::PeerManager;
 use ergo_state::StateManager;
+use ergo_storage::ExtraIndexer;
 use ergo_wallet::{Wallet, WalletConfig};
 use std::sync::Arc;
 
@@ -20,6 +21,8 @@ pub struct AppState {
     pub candidate_generator: Arc<CandidateGenerator>,
     /// Wallet (optional).
     pub wallet: Option<Arc<Wallet>>,
+    /// Extra indexer (optional).
+    pub indexer: Option<Arc<ExtraIndexer>>,
     /// Node name.
     pub node_name: String,
     /// API key (if required).
@@ -46,10 +49,17 @@ impl AppState {
             peers,
             candidate_generator,
             wallet: None,
+            indexer: None,
             node_name,
             api_key: None,
             mining_enabled: false,
         }
+    }
+
+    /// Enable extra indexer.
+    pub fn with_indexer(mut self, indexer: Arc<ExtraIndexer>) -> Self {
+        self.indexer = Some(indexer);
+        self
     }
 
     /// Set the API key.

@@ -1,5 +1,6 @@
 //! API request handlers.
 
+pub mod blockchain;
 pub mod blocks;
 pub mod emission;
 pub mod info;

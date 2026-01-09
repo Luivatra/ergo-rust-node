@@ -146,6 +146,43 @@ pub fn create_router(state: AppState) -> Router {
             "/script/executeWithContext",
             post(handlers::script::execute_with_context),
         )
+        // Blockchain indexer endpoints (optional - requires extra indexing enabled)
+        .route(
+            "/blockchain/indexedHeight",
+            get(handlers::blockchain::get_indexed_height),
+        )
+        .route(
+            "/blockchain/transaction/byId/:id",
+            get(handlers::blockchain::get_transaction_by_id),
+        )
+        .route(
+            "/blockchain/transaction/byIndex/:index",
+            get(handlers::blockchain::get_transaction_by_index),
+        )
+        .route(
+            "/blockchain/box/byId/:id",
+            get(handlers::blockchain::get_box_by_id),
+        )
+        .route(
+            "/blockchain/box/byIndex/:index",
+            get(handlers::blockchain::get_box_by_index),
+        )
+        .route(
+            "/blockchain/token/byId/:id",
+            get(handlers::blockchain::get_token_by_id),
+        )
+        .route(
+            "/blockchain/balance/byAddress",
+            get(handlers::blockchain::get_balance_by_address),
+        )
+        .route(
+            "/blockchain/box/byAddress",
+            get(handlers::blockchain::get_boxes_by_address),
+        )
+        .route(
+            "/blockchain/box/byTokenId",
+            get(handlers::blockchain::get_boxes_by_token_id),
+        )
         // Apply middleware
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
