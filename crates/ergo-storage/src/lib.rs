@@ -19,13 +19,18 @@
 //! - `TxIndex`: Transaction index (TxId -> BlockId + position)
 //! - `Metadata`: Node metadata and configuration
 
+mod batch;
 mod database;
 mod error;
-mod batch;
+pub mod indexer;
 
-pub use database::{Database, ColumnFamily};
-pub use error::{StorageError, StorageResult};
 pub use batch::WriteBatch;
+pub use database::{ColumnFamily, Database};
+pub use error::{StorageError, StorageResult};
+pub use indexer::{
+    BalanceInfo, ExtraIndexer, IndexedErgoAddress, IndexedErgoBox, IndexedErgoTransaction,
+    IndexedToken, IndexerConfig, IndexerState,
+};
 
 /// Storage trait for abstracting database operations.
 ///
@@ -49,7 +54,10 @@ pub trait Storage: Send + Sync {
     fn write_batch(&self, batch: WriteBatch) -> StorageResult<()>;
 
     /// Create an iterator over a column family.
-    fn iter(&self, cf: ColumnFamily) -> StorageResult<Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_>>;
+    fn iter(
+        &self,
+        cf: ColumnFamily,
+    ) -> StorageResult<Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_>>;
 
     /// Get multiple values by keys from a column family.
     fn multi_get(&self, cf: ColumnFamily, keys: &[&[u8]]) -> StorageResult<Vec<Option<Vec<u8>>>> {

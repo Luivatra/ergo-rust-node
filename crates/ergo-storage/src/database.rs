@@ -36,6 +36,12 @@ pub enum ColumnFamily {
     CumulativeDifficulty,
     /// Node metadata and configuration.
     Metadata,
+    /// Extra indexes for addresses, tokens, transactions, boxes.
+    ExtraIndex,
+    /// Numeric box index (global_index -> box_id).
+    BoxIndex,
+    /// Numeric transaction index (global_index -> tx_id).
+    TxNumericIndex,
     /// Default column family (required by RocksDB).
     Default,
 }
@@ -57,6 +63,9 @@ impl ColumnFamily {
             ColumnFamily::TokenIndex => "token_index",
             ColumnFamily::CumulativeDifficulty => "cumulative_difficulty",
             ColumnFamily::Metadata => "metadata",
+            ColumnFamily::ExtraIndex => "extra_index",
+            ColumnFamily::BoxIndex => "box_index",
+            ColumnFamily::TxNumericIndex => "tx_numeric_index",
             ColumnFamily::Default => "default",
         }
     }
@@ -77,6 +86,9 @@ impl ColumnFamily {
             ColumnFamily::TokenIndex,
             ColumnFamily::CumulativeDifficulty,
             ColumnFamily::Metadata,
+            ColumnFamily::ExtraIndex,
+            ColumnFamily::BoxIndex,
+            ColumnFamily::TxNumericIndex,
             ColumnFamily::Default,
         ]
     }
