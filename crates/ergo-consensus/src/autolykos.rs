@@ -245,9 +245,9 @@ impl AutolykosV2 {
 /// nBits format: 0x[size][word]
 /// - size: 1 byte indicating the byte length of the target
 /// - word: 3 bytes representing the most significant bytes of the target
-pub fn nbits_to_target(nbits: u64) -> BigUint {
+pub fn nbits_to_target(nbits: u32) -> BigUint {
     let size = ((nbits >> 24) & 0xff) as usize;
-    let word = (nbits & 0x007fffff) as u32;
+    let word = nbits & 0x007fffff;
 
     if size == 0 {
         return BigUint::from(0u32);
@@ -261,7 +261,7 @@ pub fn nbits_to_target(nbits: u64) -> BigUint {
 }
 
 /// Convert target BigUint to nBits compact representation.
-pub fn target_to_nbits(target: &BigUint) -> u64 {
+pub fn target_to_nbits(target: &BigUint) -> u32 {
     if *target == BigUint::from(0u32) {
         return 0;
     }
@@ -290,12 +290,12 @@ pub fn target_to_nbits(target: &BigUint) -> u64 {
     } else {
         (size << 24) | word
     };
-    result as u64
+    result
 }
 
 /// Calculate difficulty from nBits.
 /// Difficulty = MaxTarget / Target
-pub fn nbits_to_difficulty(nbits: u64) -> BigUint {
+pub fn nbits_to_difficulty(nbits: u32) -> BigUint {
     let target = nbits_to_target(nbits);
     if target == BigUint::from(0u32) {
         return max_target();
@@ -317,9 +317,9 @@ mod tests {
     #[test]
     fn test_nbits_conversion_roundtrip() {
         let test_cases = vec![
-            0x1d00ffffu64, // Early Bitcoin-style target
-            0x1b0404cbu64, // Example target
-            0x17034d4bu64, // Smaller target (higher difficulty)
+            0x1d00ffffu32, // Early Bitcoin-style target
+            0x1b0404cbu32, // Example target
+            0x17034d4bu32, // Smaller target (higher difficulty)
         ];
 
         for nbits in test_cases {
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn test_nbits_to_target_examples() {
         // Test known conversions
-        let nbits = 0x1d00ffff_u64;
+        let nbits = 0x1d00ffff_u32;
         let target = nbits_to_target(nbits);
         assert!(target > BigUint::from(0u32));
 
@@ -379,12 +379,12 @@ mod tests {
 
     #[test]
     fn test_difficulty_calculation() {
-        let nbits = 0x1d00ffff_u64;
+        let nbits = 0x1d00ffff_u32;
         let difficulty = nbits_to_difficulty(nbits);
         assert!(difficulty > BigUint::from(0u32));
 
         // Higher difficulty (lower target) should give higher difficulty value
-        let nbits_harder = 0x1c00ffff_u64;
+        let nbits_harder = 0x1c00ffff_u32;
         let difficulty_harder = nbits_to_difficulty(nbits_harder);
         assert!(difficulty_harder > difficulty);
     }

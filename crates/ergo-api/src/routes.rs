@@ -88,6 +88,64 @@ pub fn create_router(state: AppState) -> Router {
             "/wallet/transaction/send",
             post(handlers::wallet::send_transaction),
         )
+        // Utils endpoints
+        .route("/utils/seed", get(handlers::utils::get_seed))
+        .route(
+            "/utils/seed/:length",
+            get(handlers::utils::get_seed_with_length),
+        )
+        .route("/utils/hash/blake2b", post(handlers::utils::hash_blake2b))
+        .route(
+            "/utils/address/:address",
+            get(handlers::utils::validate_address),
+        )
+        .route(
+            "/utils/address",
+            post(handlers::utils::validate_address_post),
+        )
+        .route(
+            "/utils/addressToRaw/:address",
+            get(handlers::utils::address_to_raw),
+        )
+        .route(
+            "/utils/rawToAddress/:raw",
+            get(handlers::utils::raw_to_address),
+        )
+        .route(
+            "/utils/ergoTreeToAddress/:ergoTree",
+            get(handlers::utils::ergo_tree_to_address),
+        )
+        .route(
+            "/utils/ergoTreeToAddress",
+            post(handlers::utils::ergo_tree_to_address_post),
+        )
+        // Emission endpoints
+        .route(
+            "/emission/at/:height",
+            get(handlers::emission::get_emission_at_height),
+        )
+        .route(
+            "/emission/scripts",
+            get(handlers::emission::get_emission_scripts),
+        )
+        // Script endpoints
+        .route("/script/p2sAddress", post(handlers::script::compile_to_p2s))
+        .route(
+            "/script/p2shAddress",
+            post(handlers::script::compile_to_p2sh),
+        )
+        .route(
+            "/script/addressToTree",
+            post(handlers::script::address_to_tree),
+        )
+        .route(
+            "/script/addressToBytes",
+            post(handlers::script::address_to_bytes),
+        )
+        .route(
+            "/script/executeWithContext",
+            post(handlers::script::execute_with_context),
+        )
         // Apply middleware
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())

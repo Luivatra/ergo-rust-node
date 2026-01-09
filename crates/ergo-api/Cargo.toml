@@ -39,6 +39,8 @@ tracing.workspace = true
 
 # Utilities
 hex.workspace = true
+blake2.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

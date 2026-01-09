@@ -33,13 +33,13 @@ ergo-api = { path = "crates/ergo-api" }
 ergo-mining = { path = "crates/ergo-mining" }
 ergo-wallet = { path = "crates/ergo-wallet" }
 
-# sigma-rust dependencies
-ergo-lib = "0.28"
-ergotree-interpreter = "0.28"
-ergo-chain-types = "0.15"
-sigma-ser = "0.19"
-ergo-nipopow = "0.15"
-ergo-merkle-tree = "0.15"
+# sigma-rust dependencies (using develop branch for ErgoTree v2+ support)
+ergo-lib = { git = "https://github.com/ergoplatform/sigma-rust", branch = "develop" }
+ergotree-interpreter = { git = "https://github.com/ergoplatform/sigma-rust", branch = "develop" }
+ergo-chain-types = { git = "https://github.com/ergoplatform/sigma-rust", branch = "develop" }
+sigma-ser = { git = "https://github.com/ergoplatform/sigma-rust", branch = "develop" }
+ergo-nipopow = { git = "https://github.com/ergoplatform/sigma-rust", branch = "develop" }
+ergo-merkle-tree = { git = "https://github.com/ergoplatform/sigma-rust", branch = "develop" }
 ergo_avltree_rust = "0.1"
 
 # Async runtime

@@ -9,11 +9,25 @@
 use crate::{ConsensusError, ConsensusResult};
 use ergo_chain_types::{Header, PreHeader};
 use ergo_lib::chain::transaction::Transaction;
+use ergo_lib::ergotree_ir::chain::context::{Context, ContextExtensionProvider, TxIoVec};
+use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
-use ergotree_interpreter::eval::context::{Context, TxIoVec};
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use ergotree_interpreter::sigma_protocol::prover::ProofBytes;
 use ergotree_interpreter::sigma_protocol::verifier::Verifier;
+use std::cell::Cell;
 use tracing::{debug, instrument, warn};
+
+/// Provides context extensions for transaction inputs during verification.
+struct TxContextExtensionProvider<'a> {
+    extensions: &'a [ContextExtension],
+}
+
+impl<'a> ContextExtensionProvider for TxContextExtensionProvider<'a> {
+    fn context_extension(&self, input_index: usize) -> Option<&ContextExtension> {
+        self.extensions.get(input_index)
+    }
+}
 
 /// Transaction verification result.
 #[derive(Debug, Clone)]
@@ -101,6 +115,16 @@ impl TxVerifier {
             }
         };
 
+        // Collect all context extensions for the extension provider
+        let extensions: Vec<ContextExtension> = tx
+            .inputs
+            .iter()
+            .map(|input| input.spending_proof.extension.clone())
+            .collect();
+        let extension_provider = TxContextExtensionProvider {
+            extensions: &extensions,
+        };
+
         // Verify each input's spending condition
         for (idx, (input, input_box)) in tx.inputs.iter().zip(input_boxes.iter()).enumerate() {
             // Get the spending proof from the input
@@ -111,8 +135,8 @@ impl TxVerifier {
                 ProofBytes::Some(proof_bytes.into())
             };
 
-            // Get context extension
-            let extension = input.spending_proof.extension.clone();
+            // Get context extension for this input
+            let extension = &extensions[idx];
 
             // Create context for this input
             let ctx = Context {
@@ -124,6 +148,8 @@ impl TxVerifier {
                 pre_header: self.pre_header.clone(),
                 headers: self.headers.clone(),
                 extension,
+                tree_version: Cell::new(ErgoTreeVersion::V0),
+                extension_provider: &extension_provider,
             };
 
             // Get the ErgoTree from the input box

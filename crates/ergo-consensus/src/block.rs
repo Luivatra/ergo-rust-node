@@ -44,6 +44,7 @@ pub fn genesis_parent_header() -> Header {
         extension_root: zero_digest,
         autolykos_solution,
         votes: Votes([0u8; 3]),
+        unparsed_bytes: Box::new([]),
     }
 }
 

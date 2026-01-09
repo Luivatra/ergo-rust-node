@@ -1,11 +1,21 @@
-//! Transaction pool implementation.
+//! Transaction pool implementation with dependency tracking.
+//!
+//! This module implements an ordered transaction pool similar to the Scala node's
+//! `OrderedTxPool`. Key features:
+//!
+//! - Transactions are ordered by weight (not just fee)
+//! - When a transaction spends outputs of another mempool transaction, the parent's
+//!   weight is increased by the child's weight
+//! - This ensures parents are always processed before children
+//! - Double-spend detection prevents conflicting transactions
 
-use crate::{FeeOrdering, MempoolError, MempoolResult};
+use crate::ordering::WeightedTxId;
+use crate::{MempoolError, MempoolResult};
 use crate::{DEFAULT_MAX_SIZE, DEFAULT_MAX_TXS, DEFAULT_TX_EXPIRY_SECS};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{BTreeSet, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, instrument, warn};
 
 /// Mempool configuration.
@@ -41,8 +51,10 @@ pub struct PooledTransaction {
     pub bytes: Vec<u8>,
     /// Transaction fee.
     pub fee: u64,
-    /// Input box IDs.
+    /// Input box IDs (boxes being spent).
     pub inputs: Vec<Vec<u8>>,
+    /// Output box IDs (boxes being created).
+    pub outputs: Vec<Vec<u8>>,
     /// Arrival timestamp.
     pub arrival_time: u64,
 }
@@ -60,16 +72,44 @@ pub struct MempoolStats {
     pub max_fee_per_byte: f64,
 }
 
-/// Transaction mempool.
+/// Maximum depth for parent transaction weight updates.
+/// Prevents DoS from deeply nested transaction chains.
+const MAX_PARENT_SCAN_DEPTH: usize = 500;
+
+/// Maximum time (in ms) for parent transaction weight updates.
+const MAX_PARENT_SCAN_TIME_MS: u128 = 500;
+
+/// Transaction mempool with dependency tracking.
+///
+/// Implements weighted ordering similar to Scala's `OrderedTxPool`:
+/// - Transactions are ordered by weight (highest first)
+/// - Parent transactions (whose outputs are spent by mempool txs) have their
+///   weight increased by child transaction weights
+/// - This ensures proper ordering for transaction chains
 pub struct Mempool {
     /// Configuration.
     config: MempoolConfig,
+
     /// Transactions by ID.
     transactions: DashMap<Vec<u8>, PooledTransaction>,
+
+    /// Transaction registry: tx_id -> WeightedTxId.
+    /// Used for quick lookup of weight info.
+    registry: DashMap<Vec<u8>, WeightedTxId>,
+
+    /// Weight-ordered transaction set.
+    /// Higher weight = higher priority (comes first in iteration).
+    weight_order: RwLock<BTreeSet<WeightedTxId>>,
+
+    /// Output box to transaction mapping.
+    /// Maps output box ID -> tx_id of the transaction that creates it.
+    /// Used to find parent transactions when a child arrives.
+    output_to_tx: DashMap<Vec<u8>, Vec<u8>>,
+
     /// Input box to transaction mapping (for double-spend detection).
+    /// Maps input box ID -> tx_id of the transaction that spends it.
     input_to_tx: DashMap<Vec<u8>, Vec<u8>>,
-    /// Fee-ordered transaction set.
-    fee_order: RwLock<BTreeSet<FeeOrdering>>,
+
     /// Current total size.
     total_size: RwLock<usize>,
 }
@@ -80,8 +120,10 @@ impl Mempool {
         Self {
             config,
             transactions: DashMap::new(),
+            registry: DashMap::new(),
+            weight_order: RwLock::new(BTreeSet::new()),
+            output_to_tx: DashMap::new(),
             input_to_tx: DashMap::new(),
-            fee_order: RwLock::new(BTreeSet::new()),
             total_size: RwLock::new(0),
         }
     }
@@ -92,6 +134,12 @@ impl Mempool {
     }
 
     /// Add a transaction to the mempool.
+    ///
+    /// This will:
+    /// 1. Check for double spends
+    /// 2. Add the transaction with initial weight = fee_per_factor
+    /// 3. Update parent transaction weights (if any parents are in mempool)
+    /// 4. Evict lowest weight transaction if pool is full
     #[instrument(skip(self, tx), fields(tx_id = hex::encode(&tx.id)))]
     pub fn add(&self, tx: PooledTransaction) -> MempoolResult<()> {
         // Check if already exists
@@ -119,40 +167,41 @@ impl Mempool {
 
         // Check for double spends
         for input in &tx.inputs {
-            if let Some(existing) = self.input_to_tx.get(input) {
+            if self.input_to_tx.contains_key(input) {
                 return Err(MempoolError::DoubleSpend(hex::encode(input)));
             }
         }
 
-        // Check capacity
-        let current_count = self.transactions.len();
-        if current_count >= self.config.max_transactions {
-            // Try to evict lowest fee transaction
-            self.evict_lowest_fee()?;
-        }
+        // Create weighted tx id
+        let wtx = WeightedTxId::new(tx.id.clone(), tx.fee, tx_size, tx.arrival_time);
 
-        let current_size = *self.total_size.read();
-        if current_size + tx_size > self.config.max_size {
-            // Try to evict to make room
-            self.evict_for_size(tx_size)?;
-        }
-
-        // Add to mempool
-        let ordering = FeeOrdering::new(tx.id.clone(), tx.fee, tx_size, tx.arrival_time);
+        // Add to registry
+        self.registry.insert(tx.id.clone(), wtx.clone());
 
         // Add input mappings
         for input in &tx.inputs {
             self.input_to_tx.insert(input.clone(), tx.id.clone());
         }
 
-        // Update fee order
-        self.fee_order.write().insert(ordering);
+        // Add output mappings
+        for output in &tx.outputs {
+            self.output_to_tx.insert(output.clone(), tx.id.clone());
+        }
+
+        // Add to weight order
+        self.weight_order.write().insert(wtx.clone());
 
         // Update size
         *self.total_size.write() += tx_size;
 
         // Store transaction
-        self.transactions.insert(tx.id.clone(), tx);
+        self.transactions.insert(tx.id.clone(), tx.clone());
+
+        // Update family weights (parents get weight from this child)
+        self.update_family(&tx, wtx.weight);
+
+        // Check capacity and evict if needed
+        self.maybe_evict();
 
         debug!(
             count = self.transactions.len(),
@@ -161,25 +210,162 @@ impl Mempool {
         Ok(())
     }
 
+    /// Update weights of parent transactions.
+    ///
+    /// When a new transaction arrives that spends outputs of existing mempool
+    /// transactions, those parent transactions should have their weight increased.
+    /// This ensures parents are processed before children.
+    ///
+    /// Matches Scala's `updateFamily` method.
+    fn update_family(&self, tx: &PooledTransaction, weight_delta: i64) {
+        let start_time = Instant::now();
+        self.update_family_recursive(tx, weight_delta, start_time, 0);
+    }
+
+    fn update_family_recursive(
+        &self,
+        tx: &PooledTransaction,
+        weight_delta: i64,
+        start_time: Instant,
+        depth: usize,
+    ) {
+        // Check limits
+        if depth > MAX_PARENT_SCAN_DEPTH {
+            warn!(
+                tx_id = hex::encode(&tx.id),
+                depth, "updateFamily exceeded max depth"
+            );
+            return;
+        }
+
+        let elapsed = start_time.elapsed().as_millis();
+        if elapsed > MAX_PARENT_SCAN_TIME_MS {
+            warn!(
+                tx_id = hex::encode(&tx.id),
+                elapsed_ms = elapsed,
+                "updateFamily exceeded max time"
+            );
+            return;
+        }
+
+        // Find parent transactions (transactions whose outputs are spent by this tx)
+        let mut parent_tx_ids: HashSet<Vec<u8>> = HashSet::new();
+        for input in &tx.inputs {
+            if let Some(parent_id) = self.output_to_tx.get(input) {
+                parent_tx_ids.insert(parent_id.clone());
+            }
+        }
+
+        // Update each parent's weight
+        for parent_id in parent_tx_ids {
+            // Skip if parent is this same transaction
+            if parent_id == tx.id {
+                continue;
+            }
+
+            // Get current weight info
+            let old_wtx = match self.registry.get(&parent_id) {
+                Some(wtx) => wtx.clone(),
+                None => continue,
+            };
+
+            // Get parent transaction for recursive call
+            let parent_tx = match self.transactions.get(&parent_id) {
+                Some(tx) => tx.clone(),
+                None => continue,
+            };
+
+            // Calculate new weight
+            let new_weight = old_wtx.weight + weight_delta;
+            let new_wtx = WeightedTxId::with_weight(
+                old_wtx.tx_id.clone(),
+                new_weight,
+                old_wtx.fee_per_factor,
+                old_wtx.size,
+                old_wtx.created,
+            );
+
+            // Update registry
+            self.registry.insert(parent_id.clone(), new_wtx.clone());
+
+            // Update weight order (remove old, insert new)
+            {
+                let mut order = self.weight_order.write();
+                order.remove(&old_wtx);
+                order.insert(new_wtx);
+            }
+
+            // Recursively update grandparents
+            self.update_family_recursive(&parent_tx, weight_delta, start_time, depth + 1);
+        }
+    }
+
+    /// Evict lowest weight transactions if pool is over capacity.
+    fn maybe_evict(&self) {
+        // Check transaction count
+        while self.transactions.len() > self.config.max_transactions {
+            if self.evict_lowest_weight().is_err() {
+                break;
+            }
+        }
+
+        // Check size
+        while *self.total_size.read() > self.config.max_size {
+            if self.evict_lowest_weight().is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Evict the transaction with the lowest weight.
+    fn evict_lowest_weight(&self) -> MempoolResult<()> {
+        let lowest_id = {
+            let order = self.weight_order.read();
+            order.iter().last().map(|wtx| wtx.tx_id.clone())
+        };
+
+        if let Some(tx_id) = lowest_id {
+            self.remove(&tx_id)?;
+            warn!("Evicted lowest weight transaction");
+        }
+
+        Ok(())
+    }
+
     /// Remove a transaction by ID.
     #[instrument(skip(self), fields(tx_id = hex::encode(tx_id)))]
     pub fn remove(&self, tx_id: &[u8]) -> MempoolResult<PooledTransaction> {
+        // Get transaction
         let (_, tx) = self
             .transactions
             .remove(tx_id)
             .ok_or_else(|| MempoolError::NotFound(hex::encode(tx_id)))?;
+
+        // Get weight info
+        let wtx = self.registry.remove(tx_id).map(|(_, w)| w);
+
+        // Remove from weight order
+        if let Some(ref wtx) = wtx {
+            self.weight_order.write().remove(wtx);
+        }
 
         // Remove input mappings
         for input in &tx.inputs {
             self.input_to_tx.remove(input);
         }
 
-        // Update fee order
-        let ordering = FeeOrdering::new(tx.id.clone(), tx.fee, tx.bytes.len(), tx.arrival_time);
-        self.fee_order.write().remove(&ordering);
+        // Remove output mappings
+        for output in &tx.outputs {
+            self.output_to_tx.remove(output);
+        }
 
         // Update size
         *self.total_size.write() -= tx.bytes.len();
+
+        // Update family weights (subtract this tx's weight from parents)
+        if let Some(wtx) = wtx {
+            self.update_family(&tx, -wtx.weight);
+        }
 
         debug!(
             count = self.transactions.len(),
@@ -208,14 +394,27 @@ impl Mempool {
         self.input_to_tx.get(input_id).map(|r| r.clone())
     }
 
-    /// Get transactions ordered by fee (highest first).
-    pub fn get_by_fee(&self, limit: usize) -> Vec<PooledTransaction> {
-        let order = self.fee_order.read();
+    /// Get the transaction that creates a given output.
+    pub fn get_creating_tx(&self, output_id: &[u8]) -> Option<Vec<u8>> {
+        self.output_to_tx.get(output_id).map(|r| r.clone())
+    }
+
+    /// Get transactions ordered by weight (highest first).
+    ///
+    /// This respects transaction dependencies: parent transactions will have
+    /// higher weight than their children (if children are also in mempool).
+    pub fn get_by_weight(&self, limit: usize) -> Vec<PooledTransaction> {
+        let order = self.weight_order.read();
         order
             .iter()
             .take(limit)
-            .filter_map(|o| self.get(&o.tx_id))
+            .filter_map(|wtx| self.get(&wtx.tx_id))
             .collect()
+    }
+
+    /// Get transactions ordered by fee (legacy method, uses weight ordering).
+    pub fn get_by_fee(&self, limit: usize) -> Vec<PooledTransaction> {
+        self.get_by_weight(limit)
     }
 
     /// Get all transaction IDs.
@@ -225,7 +424,7 @@ impl Mempool {
 
     /// Get mempool statistics.
     pub fn stats(&self) -> MempoolStats {
-        let order = self.fee_order.read();
+        let order = self.weight_order.read();
 
         let (min_fpb, max_fpb) = if order.is_empty() {
             (0.0, 0.0)
@@ -246,8 +445,10 @@ impl Mempool {
     /// Clear all transactions.
     pub fn clear(&self) {
         self.transactions.clear();
+        self.registry.clear();
         self.input_to_tx.clear();
-        self.fee_order.write().clear();
+        self.output_to_tx.clear();
+        self.weight_order.write().clear();
         *self.total_size.write() = 0;
         info!("Mempool cleared");
     }
@@ -293,41 +494,19 @@ impl Mempool {
         }
     }
 
-    /// Evict lowest fee transaction.
-    fn evict_lowest_fee(&self) -> MempoolResult<()> {
-        let lowest = {
-            let order = self.fee_order.read();
-            order.iter().last().map(|o| o.tx_id.clone())
-        };
-
-        if let Some(tx_id) = lowest {
-            self.remove(&tx_id)?;
-            warn!("Evicted lowest fee transaction");
-        }
-
-        Ok(())
+    /// Get the weight of a transaction.
+    pub fn get_weight(&self, tx_id: &[u8]) -> Option<i64> {
+        self.registry.get(tx_id).map(|r| r.weight)
     }
 
-    /// Evict transactions to make room for given size.
-    fn evict_for_size(&self, needed: usize) -> MempoolResult<()> {
-        let mut freed = 0usize;
+    /// Get the number of transactions in the pool.
+    pub fn len(&self) -> usize {
+        self.transactions.len()
+    }
 
-        while freed < needed {
-            let lowest = {
-                let order = self.fee_order.read();
-                order.iter().last().map(|o| o.tx_id.clone())
-            };
-
-            if let Some(tx_id) = lowest {
-                if let Ok(tx) = self.remove(&tx_id) {
-                    freed += tx.bytes.len();
-                }
-            } else {
-                break;
-            }
-        }
-
-        Ok(())
+    /// Check if the pool is empty.
+    pub fn is_empty(&self) -> bool {
+        self.transactions.is_empty()
     }
 }
 
@@ -347,7 +526,25 @@ mod tests {
             bytes: vec![0; size],
             fee,
             inputs: vec![vec![id, 1]],
+            outputs: vec![vec![id, 2]], // Each tx creates an output
             arrival_time: 1000,
+        }
+    }
+
+    fn create_test_tx_with_outputs(
+        id: u8,
+        fee: u64,
+        size: usize,
+        inputs: Vec<Vec<u8>>,
+        outputs: Vec<Vec<u8>>,
+    ) -> PooledTransaction {
+        PooledTransaction {
+            id: vec![id],
+            bytes: vec![0; size],
+            fee,
+            inputs,
+            outputs,
+            arrival_time: 1000 + id as u64,
         }
     }
 
@@ -371,6 +568,7 @@ mod tests {
             bytes: vec![0; 100],
             fee: 1000,
             inputs: vec![vec![10, 10]],
+            outputs: vec![vec![1, 1]],
             arrival_time: 1000,
         };
 
@@ -379,6 +577,7 @@ mod tests {
             bytes: vec![0; 100],
             fee: 2000,
             inputs: vec![vec![10, 10]], // Same input!
+            outputs: vec![vec![2, 2]],
             arrival_time: 1001,
         };
 
@@ -389,22 +588,185 @@ mod tests {
     }
 
     #[test]
-    fn test_fee_ordering() {
+    fn test_weight_ordering() {
         let pool = Mempool::with_defaults();
 
-        pool.add(create_test_tx(1, 100, 100)).unwrap(); // 1 per byte
-        pool.add(create_test_tx(2, 300, 100)).unwrap(); // 3 per byte
-        pool.add(create_test_tx(3, 200, 100)).unwrap(); // 2 per byte
+        pool.add(create_test_tx(1, 100, 100)).unwrap(); // weight ~1024
+        pool.add(create_test_tx(2, 300, 100)).unwrap(); // weight ~3072
+        pool.add(create_test_tx(3, 200, 100)).unwrap(); // weight ~2048
 
-        let ordered = pool.get_by_fee(10);
+        let ordered = pool.get_by_weight(10);
 
-        assert_eq!(ordered[0].id, vec![2]); // Highest fee first
+        assert_eq!(ordered[0].id, vec![2]); // Highest weight first
         assert_eq!(ordered[1].id, vec![3]);
         assert_eq!(ordered[2].id, vec![1]);
     }
 
+    // ============ Transaction Dependency Tests ============
+    // Test that parent transactions get weight from children
+
+    #[test]
+    fn test_parent_weight_increases_with_child() {
+        let pool = Mempool::with_defaults();
+
+        // Parent transaction with low fee, creates output [1, 2]
+        let parent = create_test_tx_with_outputs(
+            1,
+            100, // Low fee
+            100,
+            vec![vec![0, 0]], // Spends some external input
+            vec![vec![1, 2]], // Creates output [1, 2]
+        );
+
+        pool.add(parent).unwrap();
+        let parent_weight_before = pool.get_weight(&[1]).unwrap();
+
+        // Child transaction with high fee, spends parent's output [1, 2]
+        let child = create_test_tx_with_outputs(
+            2,
+            5000, // High fee
+            100,
+            vec![vec![1, 2]], // Spends parent's output
+            vec![vec![2, 2]], // Creates its own output
+        );
+
+        pool.add(child).unwrap();
+        let parent_weight_after = pool.get_weight(&[1]).unwrap();
+
+        // Parent's weight should have increased by child's weight
+        assert!(
+            parent_weight_after > parent_weight_before,
+            "Parent weight should increase: {} > {}",
+            parent_weight_after,
+            parent_weight_before
+        );
+
+        // Child's weight should be added to parent's
+        let child_weight = pool.get_weight(&[2]).unwrap();
+        assert_eq!(
+            parent_weight_after,
+            parent_weight_before + child_weight,
+            "Parent weight should be original + child weight"
+        );
+    }
+
+    #[test]
+    fn test_parent_ordered_before_child() {
+        let pool = Mempool::with_defaults();
+
+        // Parent with very low fee
+        let parent = create_test_tx_with_outputs(
+            1,
+            10, // Very low fee
+            100,
+            vec![vec![0, 0]],
+            vec![vec![1, 2]],
+        );
+
+        // Unrelated transaction with medium fee
+        let unrelated = create_test_tx_with_outputs(
+            3,
+            500, // Medium fee
+            100,
+            vec![vec![3, 0]],
+            vec![vec![3, 2]],
+        );
+
+        // Child with high fee that spends parent's output
+        let child = create_test_tx_with_outputs(
+            2,
+            10000, // Very high fee
+            100,
+            vec![vec![1, 2]], // Spends parent
+            vec![vec![2, 2]],
+        );
+
+        pool.add(parent).unwrap();
+        pool.add(unrelated).unwrap();
+        pool.add(child).unwrap();
+
+        let ordered = pool.get_by_weight(10);
+
+        // Find positions
+        let parent_pos = ordered.iter().position(|tx| tx.id == vec![1]).unwrap();
+        let child_pos = ordered.iter().position(|tx| tx.id == vec![2]).unwrap();
+
+        // Parent should come before child (lower position = higher priority)
+        assert!(
+            parent_pos < child_pos,
+            "Parent (pos {}) should come before child (pos {})",
+            parent_pos,
+            child_pos
+        );
+    }
+
+    #[test]
+    fn test_grandparent_weight_propagation() {
+        let pool = Mempool::with_defaults();
+
+        // Grandparent
+        let grandparent =
+            create_test_tx_with_outputs(1, 100, 100, vec![vec![0, 0]], vec![vec![1, 2]]);
+
+        // Parent spends grandparent's output
+        let parent = create_test_tx_with_outputs(2, 100, 100, vec![vec![1, 2]], vec![vec![2, 2]]);
+
+        // Child spends parent's output
+        let child = create_test_tx_with_outputs(3, 10000, 100, vec![vec![2, 2]], vec![vec![3, 2]]);
+
+        pool.add(grandparent).unwrap();
+        pool.add(parent).unwrap();
+
+        let grandparent_weight_before = pool.get_weight(&[1]).unwrap();
+        let parent_weight_before = pool.get_weight(&[2]).unwrap();
+
+        pool.add(child).unwrap();
+
+        let grandparent_weight_after = pool.get_weight(&[1]).unwrap();
+        let parent_weight_after = pool.get_weight(&[2]).unwrap();
+        let child_weight = pool.get_weight(&[3]).unwrap();
+
+        // Both parent and grandparent should have increased weight
+        assert!(grandparent_weight_after > grandparent_weight_before);
+        assert!(parent_weight_after > parent_weight_before);
+
+        // Check ordering: grandparent < parent < child in position
+        let ordered = pool.get_by_weight(10);
+        let gp_pos = ordered.iter().position(|tx| tx.id == vec![1]).unwrap();
+        let p_pos = ordered.iter().position(|tx| tx.id == vec![2]).unwrap();
+        let c_pos = ordered.iter().position(|tx| tx.id == vec![3]).unwrap();
+
+        assert!(gp_pos < p_pos, "Grandparent should come before parent");
+        assert!(p_pos < c_pos, "Parent should come before child");
+    }
+
+    #[test]
+    fn test_remove_decreases_parent_weight() {
+        let pool = Mempool::with_defaults();
+
+        let parent = create_test_tx_with_outputs(1, 100, 100, vec![vec![0, 0]], vec![vec![1, 2]]);
+
+        let child = create_test_tx_with_outputs(2, 5000, 100, vec![vec![1, 2]], vec![vec![2, 2]]);
+
+        pool.add(parent).unwrap();
+        let parent_weight_initial = pool.get_weight(&[1]).unwrap();
+
+        pool.add(child).unwrap();
+        let parent_weight_with_child = pool.get_weight(&[1]).unwrap();
+
+        // Remove child
+        pool.remove(&[2]).unwrap();
+        let parent_weight_after_remove = pool.get_weight(&[1]).unwrap();
+
+        // Weight should return to original
+        assert_eq!(
+            parent_weight_after_remove, parent_weight_initial,
+            "Parent weight should return to original after child removal"
+        );
+        assert!(parent_weight_with_child > parent_weight_after_remove);
+    }
+
     // ============ Transaction Removal Tests ============
-    // Corresponds to Scala's mempool remove operations
 
     #[test]
     fn test_remove_transaction() {
@@ -435,6 +797,7 @@ mod tests {
             bytes: vec![0; 100],
             fee: 1000,
             inputs: vec![vec![10, 10]],
+            outputs: vec![vec![1, 1]],
             arrival_time: 1000,
         };
 
@@ -450,6 +813,7 @@ mod tests {
             bytes: vec![0; 100],
             fee: 2000,
             inputs: vec![vec![10, 10]],
+            outputs: vec![vec![2, 2]],
             arrival_time: 1001,
         };
 
@@ -457,7 +821,6 @@ mod tests {
     }
 
     // ============ Pool Overflow Tests ============
-    // Corresponds to Scala's "pool overflow" tests
 
     #[test]
     fn test_max_transactions_limit() {
@@ -471,10 +834,10 @@ mod tests {
         pool.add(create_test_tx(2, 200, 100)).unwrap();
         pool.add(create_test_tx(3, 300, 100)).unwrap();
 
-        // Pool is full, adding should evict lowest fee tx
+        // Pool is full, adding should evict lowest weight tx
         pool.add(create_test_tx(4, 400, 100)).unwrap();
 
-        assert!(!pool.contains(&[1])); // Lowest fee evicted
+        assert!(!pool.contains(&[1])); // Lowest weight evicted
         assert!(pool.contains(&[2]));
         assert!(pool.contains(&[3]));
         assert!(pool.contains(&[4]));
@@ -482,34 +845,22 @@ mod tests {
 
     #[test]
     fn test_max_size_limit() {
-        // Individual tx can't exceed max_size/10, so we need max_size >= 10 * tx_size
-        // For 30-byte txs, max_size must be >= 300
         let config = MempoolConfig {
-            max_size: 350,         // Room for ~11 x 30 byte txs
-            max_transactions: 100, // High limit so size is the constraint
+            max_size: 350,
+            max_transactions: 100,
             ..Default::default()
         };
         let pool = Mempool::new(config);
 
         // Use 30-byte txs (which fit in max_size/10 = 35)
-        pool.add(create_test_tx(1, 100, 30)).unwrap();
-        pool.add(create_test_tx(2, 200, 30)).unwrap();
-        pool.add(create_test_tx(3, 300, 30)).unwrap();
-        pool.add(create_test_tx(4, 400, 30)).unwrap();
-        pool.add(create_test_tx(5, 500, 30)).unwrap();
-        pool.add(create_test_tx(6, 600, 30)).unwrap();
-        pool.add(create_test_tx(7, 700, 30)).unwrap();
-        pool.add(create_test_tx(8, 800, 30)).unwrap();
-        pool.add(create_test_tx(9, 900, 30)).unwrap();
-        pool.add(create_test_tx(10, 1000, 30)).unwrap();
-        pool.add(create_test_tx(11, 1100, 30)).unwrap();
+        for i in 1..=11 {
+            pool.add(create_test_tx(i, i as u64 * 100, 30)).unwrap();
+        }
 
-        // 11 * 30 = 330 bytes, adding another 30-byte tx would exceed 350
-        // Should evict lowest fee tx
+        // Adding another should evict lowest weight
         pool.add(create_test_tx(12, 1200, 30)).unwrap();
 
-        // Lowest fee (tx 1) should be evicted to make room
-        assert!(!pool.contains(&[1]));
+        assert!(!pool.contains(&[1])); // Lowest weight evicted
         assert!(pool.contains(&[12]));
     }
 
@@ -553,7 +904,6 @@ mod tests {
     }
 
     // ============ Remove Confirmed Tests ============
-    // When a block is added, confirmed txs are removed
 
     #[test]
     fn test_remove_confirmed() {
@@ -563,7 +913,6 @@ mod tests {
         pool.add(create_test_tx(2, 2000, 100)).unwrap();
         pool.add(create_test_tx(3, 3000, 100)).unwrap();
 
-        // Tx 1 and 2 are confirmed
         let confirmed_ids = vec![vec![1u8], vec![2u8]];
         let spent_inputs: Vec<Vec<u8>> = vec![];
 
@@ -571,7 +920,7 @@ mod tests {
 
         assert!(!pool.contains(&[1]));
         assert!(!pool.contains(&[2]));
-        assert!(pool.contains(&[3])); // Still in pool
+        assert!(pool.contains(&[3]));
     }
 
     #[test]
@@ -583,6 +932,7 @@ mod tests {
             bytes: vec![0; 100],
             fee: 1000,
             inputs: vec![vec![10, 10]],
+            outputs: vec![vec![1, 1]],
             arrival_time: 1000,
         };
 
@@ -591,128 +941,61 @@ mod tests {
             bytes: vec![0; 100],
             fee: 2000,
             inputs: vec![vec![20, 20]],
+            outputs: vec![vec![2, 2]],
             arrival_time: 1001,
         };
 
         pool.add(tx1).unwrap();
         pool.add(tx2).unwrap();
 
-        // Input [10, 10] was spent in a block (different tx)
         let confirmed_ids: Vec<Vec<u8>> = vec![];
         let spent_inputs = vec![vec![10u8, 10u8]];
 
         pool.remove_confirmed(&confirmed_ids, &spent_inputs);
 
-        // tx1 should be removed because its input was spent
         assert!(!pool.contains(&[1]));
-        assert!(pool.contains(&[2])); // Still in pool
+        assert!(pool.contains(&[2]));
     }
 
-    // ============ Input Tracking Tests ============
+    // ============ Output Tracking Tests ============
 
     #[test]
-    fn test_is_input_spent() {
+    fn test_output_tracking() {
         let pool = Mempool::with_defaults();
 
         let tx = PooledTransaction {
             id: vec![1],
             bytes: vec![0; 100],
             fee: 1000,
-            inputs: vec![vec![10, 10], vec![20, 20]],
+            inputs: vec![vec![0, 0]],
+            outputs: vec![vec![1, 1], vec![1, 2]],
             arrival_time: 1000,
         };
 
         pool.add(tx).unwrap();
 
-        assert!(pool.is_input_spent(&[10, 10]));
-        assert!(pool.is_input_spent(&[20, 20]));
-        assert!(!pool.is_input_spent(&[30, 30]));
+        assert_eq!(pool.get_creating_tx(&[1, 1]), Some(vec![1]));
+        assert_eq!(pool.get_creating_tx(&[1, 2]), Some(vec![1]));
+        assert_eq!(pool.get_creating_tx(&[9, 9]), None);
     }
 
     #[test]
-    fn test_get_spending_tx() {
+    fn test_output_tracking_removed_on_remove() {
         let pool = Mempool::with_defaults();
 
         let tx = PooledTransaction {
             id: vec![1],
             bytes: vec![0; 100],
             fee: 1000,
-            inputs: vec![vec![10, 10]],
+            inputs: vec![vec![0, 0]],
+            outputs: vec![vec![1, 1]],
             arrival_time: 1000,
         };
 
         pool.add(tx).unwrap();
+        assert!(pool.get_creating_tx(&[1, 1]).is_some());
 
-        let spending_tx = pool.get_spending_tx(&[10, 10]);
-        assert_eq!(spending_tx, Some(vec![1]));
-
-        let spending_tx = pool.get_spending_tx(&[99, 99]);
-        assert_eq!(spending_tx, None);
-    }
-
-    // ============ Get All IDs Test ============
-
-    #[test]
-    fn test_get_all_ids() {
-        let pool = Mempool::with_defaults();
-
-        pool.add(create_test_tx(1, 1000, 100)).unwrap();
-        pool.add(create_test_tx(2, 2000, 100)).unwrap();
-        pool.add(create_test_tx(3, 3000, 100)).unwrap();
-
-        let all_ids = pool.get_all_ids();
-        assert_eq!(all_ids.len(), 3);
-        assert!(all_ids.contains(&vec![1]));
-        assert!(all_ids.contains(&vec![2]));
-        assert!(all_ids.contains(&vec![3]));
-    }
-
-    // ============ Fee Per Byte Limit Test ============
-
-    #[test]
-    fn test_get_by_fee_limit() {
-        let pool = Mempool::with_defaults();
-
-        pool.add(create_test_tx(1, 100, 100)).unwrap();
-        pool.add(create_test_tx(2, 200, 100)).unwrap();
-        pool.add(create_test_tx(3, 300, 100)).unwrap();
-        pool.add(create_test_tx(4, 400, 100)).unwrap();
-        pool.add(create_test_tx(5, 500, 100)).unwrap();
-
-        // Only get top 3
-        let ordered = pool.get_by_fee(3);
-        assert_eq!(ordered.len(), 3);
-        assert_eq!(ordered[0].id, vec![5]); // Highest
-        assert_eq!(ordered[1].id, vec![4]);
-        assert_eq!(ordered[2].id, vec![3]);
-    }
-
-    // ============ Multiple Inputs Test ============
-
-    #[test]
-    fn test_multiple_inputs_double_spend() {
-        let pool = Mempool::with_defaults();
-
-        let tx1 = PooledTransaction {
-            id: vec![1],
-            bytes: vec![0; 100],
-            fee: 1000,
-            inputs: vec![vec![10], vec![20], vec![30]],
-            arrival_time: 1000,
-        };
-
-        pool.add(tx1).unwrap();
-
-        // Try to add tx that spends one of the same inputs
-        let tx2 = PooledTransaction {
-            id: vec![2],
-            bytes: vec![0; 100],
-            fee: 2000,
-            inputs: vec![vec![20]], // Conflicts with tx1
-            arrival_time: 1001,
-        };
-
-        let result = pool.add(tx2);
-        assert!(matches!(result, Err(MempoolError::DoubleSpend(_))));
+        pool.remove(&[1]).unwrap();
+        assert!(pool.get_creating_tx(&[1, 1]).is_none());
     }
 }

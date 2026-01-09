@@ -45,8 +45,9 @@ pub async fn submit_transaction(
     let pooled = ergo_mempool::PooledTransaction {
         id: id.clone(),
         bytes,
-        fee: 0,             // Would extract from transaction
-        inputs: Vec::new(), // Would extract from transaction
+        fee: 0,              // Would extract from transaction
+        inputs: Vec::new(),  // Would extract from transaction
+        outputs: Vec::new(), // Would extract from transaction
         arrival_time: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

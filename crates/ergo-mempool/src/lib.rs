@@ -3,18 +3,30 @@
 //! Transaction mempool for the Ergo blockchain.
 //!
 //! This crate provides:
-//! - Transaction storage with fee-based ordering
+//! - Transaction storage with weight-based ordering
+//! - Transaction dependency tracking (parent transactions get weight from children)
 //! - Transaction validation before acceptance
 //! - Double-spend detection
 //! - Size limits and eviction policies
-//! - Transaction dependency tracking
+//!
+//! ## Transaction Ordering
+//!
+//! Transactions are ordered by weight, not just fee. When a transaction spends
+//! outputs of another mempool transaction, the parent's weight is increased by
+//! the child's weight. This ensures:
+//!
+//! 1. Parent transactions are always processed before children
+//! 2. Transaction chains are kept together during block creation
+//! 3. Eviction of a parent also conceptually affects the child's viability
+//!
+//! This matches the Scala node's `OrderedTxPool` implementation.
 
 mod error;
 mod ordering;
 mod pool;
 
 pub use error::{MempoolError, MempoolResult};
-pub use ordering::FeeOrdering;
+pub use ordering::{FeeOrdering, WeightedTxId};
 pub use pool::{Mempool, MempoolConfig, MempoolStats, PooledTransaction};
 
 /// Default maximum mempool size in bytes.

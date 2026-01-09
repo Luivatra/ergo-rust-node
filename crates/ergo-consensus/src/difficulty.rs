@@ -16,7 +16,7 @@ pub struct HeaderForDifficulty {
     /// Block timestamp in milliseconds.
     pub timestamp: u64,
     /// Required difficulty (nBits).
-    pub n_bits: u64,
+    pub n_bits: u32,
 }
 
 /// Difficulty adjustment calculator.
@@ -66,7 +66,7 @@ impl DifficultyAdjustment {
         &self,
         headers: &[HeaderForDifficulty],
         next_height: u32,
-    ) -> ConsensusResult<u64> {
+    ) -> ConsensusResult<u32> {
         // For the first epoch, use genesis difficulty
         if next_height <= self.epoch_length {
             return Ok(headers.first().map(|h| h.n_bits).unwrap_or(0x1f00ffff)); // Default genesis difficulty
@@ -99,7 +99,7 @@ impl DifficultyAdjustment {
     fn linear_regression_difficulty(
         &self,
         headers: &[HeaderForDifficulty],
-    ) -> ConsensusResult<u64> {
+    ) -> ConsensusResult<u32> {
         let n = headers.len() as f64;
         if n < 2.0 {
             return Err(ConsensusError::InvalidDifficulty {
@@ -171,7 +171,7 @@ impl DifficultyAdjustment {
 pub fn calculate_required_difficulty(
     headers: &[HeaderForDifficulty],
     next_height: u32,
-) -> ConsensusResult<u64> {
+) -> ConsensusResult<u32> {
     DifficultyAdjustment::new().calculate_next_difficulty(headers, next_height)
 }
 

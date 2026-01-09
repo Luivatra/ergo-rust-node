@@ -26,7 +26,7 @@ pub struct BlockHeader {
     pub parent_id: String,
     pub height: u32,
     pub timestamp: u64,
-    pub n_bits: u64,
+    pub n_bits: u32,
     pub difficulty: String,
 }
 

@@ -16,6 +16,11 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     /// State type (utxo, digest).
     pub state_type: StateType,
+    /// Number of blocks to keep in history.
+    /// -1 means keep all blocks (no pruning).
+    /// Positive values enable pruning, keeping only the last N blocks.
+    #[serde(default = "default_blocks_to_keep")]
+    pub blocks_to_keep: i32,
     /// Network configuration.
     #[serde(default)]
     pub network_config: NetworkConfig,
@@ -28,6 +33,11 @@ pub struct NodeConfig {
     /// Wallet configuration.
     #[serde(default)]
     pub wallet: WalletConfig,
+}
+
+/// Default blocks to keep (-1 = keep all).
+fn default_blocks_to_keep() -> i32 {
+    -1
 }
 
 /// State type.
@@ -161,6 +171,7 @@ impl NodeConfig {
             network: network.to_string(),
             data_dir,
             state_type: StateType::Utxo,
+            blocks_to_keep: -1, // Keep all blocks by default
             network_config: NetworkConfig {
                 known_peers,
                 ..Default::default()

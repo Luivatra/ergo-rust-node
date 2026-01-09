@@ -105,10 +105,11 @@ mod tests {
             "Direct hash should match explorer ID"
         );
 
-        // But sigma-rust's computed ID is based on reserialized bytes, so it differs
-        assert_ne!(
+        // With sigma-rust develop branch, the BigInt serialization issue is fixed
+        // so computed ID now matches the expected ID
+        assert_eq!(
             computed_id, expected_id,
-            "sigma-rust's ID differs due to BigInt serialization issue"
+            "sigma-rust's ID should now match due to BigInt serialization fix"
         );
 
         // Verify we can parse the header

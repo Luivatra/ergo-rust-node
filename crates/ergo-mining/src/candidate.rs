@@ -20,7 +20,7 @@ pub struct BlockCandidate {
     /// Timestamp.
     pub timestamp: u64,
     /// Difficulty target (nBits).
-    pub n_bits: u64,
+    pub n_bits: u32,
     /// Transactions root.
     pub transactions_root: Vec<u8>,
     /// State root.
@@ -159,7 +159,7 @@ impl CandidateGenerator {
     }
 
     /// Calculate difficulty for the next block based on recent headers.
-    fn calculate_difficulty(&self, next_height: u32) -> MiningResult<u64> {
+    fn calculate_difficulty(&self, next_height: u32) -> MiningResult<u32> {
         // Get recent headers for difficulty calculation
         let headers_needed = 8 * 1024; // 8 epochs worth
         let start_height = next_height.saturating_sub(headers_needed);
@@ -228,7 +228,7 @@ impl CandidateGenerator {
         parent_id: Option<&BlockId>,
         height: u32,
         timestamp: u64,
-        n_bits: u64,
+        n_bits: u32,
         transactions_root: &[u8],
         state_root: &[u8],
         extension_hash: &[u8],

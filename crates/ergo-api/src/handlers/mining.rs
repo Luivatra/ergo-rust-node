@@ -86,7 +86,7 @@ pub struct RewardAddressRequest {
 ///
 /// nBits uses a compact representation: the first byte is the size (number of bytes),
 /// and the remaining 3 bytes are the most significant bytes of the target.
-fn nbits_to_target(n_bits: u64) -> String {
+fn nbits_to_target(n_bits: u32) -> String {
     // nBits encoding: first byte is size in bytes, next 3 bytes are coefficient
     let size = ((n_bits >> 24) & 0xff) as usize;
     let coeff = n_bits & 0x00ffffff;

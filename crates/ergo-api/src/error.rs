@@ -27,6 +27,10 @@ pub enum ApiError {
     #[error("Unauthorized")]
     Unauthorized,
 
+    /// Not implemented.
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
+
     /// State error.
     #[error("State error: {0}")]
     State(#[from] ergo_state::StateError),
@@ -73,6 +77,14 @@ impl IntoResponse for ApiError {
                     error: 401,
                     reason: "Unauthorized".to_string(),
                     detail: "API key required".to_string(),
+                },
+            ),
+            ApiError::NotImplemented(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                ErrorResponse {
+                    error: 501,
+                    reason: "Not Implemented".to_string(),
+                    detail: msg.clone(),
                 },
             ),
             ApiError::Internal(msg) => (

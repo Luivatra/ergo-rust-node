@@ -21,7 +21,7 @@ mod manager;
 mod utxo;
 
 pub use error::{StateError, StateResult};
-pub use history::{BlockSection, BlockStore, ChainSelection, HeaderStore, History};
+pub use history::{BlockSection, BlockStore, ChainSelection, HeaderStore, History, PruningConfig};
 pub use manager::{StateManager, StateRootVerification};
 pub use utxo::{BoxEntry, StateChange, UndoData, UtxoState};
 

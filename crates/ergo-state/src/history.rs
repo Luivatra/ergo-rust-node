@@ -1,6 +1,7 @@
 //! Block history management.
 //!
 //! Tracks block headers, full blocks, and manages chain selection.
+//! Supports block pruning to reduce storage requirements.
 
 use crate::{columns, StateError, StateResult};
 use ergo_chain_types::{BlockId, Digest32, Header};
@@ -10,8 +11,16 @@ use ergo_storage::{ColumnFamily, Storage, WriteBatch};
 use num_bigint::BigUint;
 use parking_lot::RwLock;
 use sigma_ser::ScorexSerializable;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
+
+/// Ergo voting epoch length (1024 blocks).
+/// Extension blocks at epoch boundaries contain protocol parameters and must be kept.
+const VOTING_EPOCH_LENGTH: u32 = 1024;
+
+/// Genesis block height.
+const GENESIS_HEIGHT: u32 = 1;
 
 /// Chain selection result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +330,31 @@ impl BlockStore {
     }
 }
 
+/// Pruning configuration for block history.
+#[derive(Debug, Clone)]
+pub struct PruningConfig {
+    /// Number of blocks to keep (-1 = keep all).
+    pub blocks_to_keep: i32,
+}
+
+impl Default for PruningConfig {
+    fn default() -> Self {
+        Self { blocks_to_keep: -1 }
+    }
+}
+
+impl PruningConfig {
+    /// Create a new pruning config.
+    pub fn new(blocks_to_keep: i32) -> Self {
+        Self { blocks_to_keep }
+    }
+
+    /// Check if pruning is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.blocks_to_keep >= 0
+    }
+}
+
 /// Block history manager.
 pub struct History {
     /// Header storage.
@@ -339,11 +373,22 @@ pub struct History {
     best_full_block_id: RwLock<Option<BlockId>>,
     /// Best full block height.
     best_full_block_height: RwLock<u32>,
+    /// Pruning configuration.
+    pruning_config: PruningConfig,
+    /// Minimal full block height (blocks below this are pruned or not downloaded).
+    minimal_full_block_height: AtomicU32,
+    /// Whether headers chain is synced (full blocks can be downloaded).
+    is_headers_chain_synced: AtomicBool,
 }
 
 impl History {
     /// Create a new history manager.
     pub fn new(storage: Arc<dyn Storage>) -> Self {
+        Self::with_pruning(storage, PruningConfig::default())
+    }
+
+    /// Create a new history manager with pruning configuration.
+    pub fn with_pruning(storage: Arc<dyn Storage>, pruning_config: PruningConfig) -> Self {
         Self {
             headers: HeaderStore::new(Arc::clone(&storage)),
             blocks: BlockStore::new(Arc::clone(&storage)),
@@ -353,12 +398,23 @@ impl History {
             best_cumulative_difficulty: RwLock::new(BigUint::from(0u32)),
             best_full_block_id: RwLock::new(None),
             best_full_block_height: RwLock::new(0),
+            pruning_config,
+            minimal_full_block_height: AtomicU32::new(GENESIS_HEIGHT),
+            is_headers_chain_synced: AtomicBool::new(false),
         }
     }
 
     /// Initialize from storage.
     pub fn init_from_storage(storage: Arc<dyn Storage>) -> StateResult<Self> {
-        let history = Self::new(storage);
+        Self::init_from_storage_with_pruning(storage, PruningConfig::default())
+    }
+
+    /// Initialize from storage with pruning configuration.
+    pub fn init_from_storage_with_pruning(
+        storage: Arc<dyn Storage>,
+        pruning_config: PruningConfig,
+    ) -> StateResult<Self> {
+        let history = Self::with_pruning(storage, pruning_config);
 
         // Load best header ID
         if let Some(id_bytes) = history
@@ -414,10 +470,38 @@ impl History {
             }
         }
 
+        // Load minimal full block height
+        if let Some(height_bytes) = history
+            .storage
+            .get(ColumnFamily::Metadata, b"minimal_full_block_height")?
+        {
+            if height_bytes.len() >= 4 {
+                let height = u32::from_be_bytes(height_bytes[0..4].try_into().unwrap());
+                history
+                    .minimal_full_block_height
+                    .store(height, Ordering::SeqCst);
+            }
+        }
+
+        // Load headers chain synced flag
+        if let Some(flag_bytes) = history
+            .storage
+            .get(ColumnFamily::Metadata, b"is_headers_chain_synced")?
+        {
+            if !flag_bytes.is_empty() && flag_bytes[0] == 1 {
+                history
+                    .is_headers_chain_synced
+                    .store(true, Ordering::SeqCst);
+            }
+        }
+
         info!(
             best_height = history.best_height(),
             best_full_block_height = history.best_full_block_height(),
+            minimal_full_block_height = history.minimal_full_block_height(),
             best_cumulative_difficulty = %history.best_cumulative_difficulty(),
+            pruning_enabled = history.pruning_config.is_enabled(),
+            blocks_to_keep = history.pruning_config.blocks_to_keep,
             "History initialized from storage"
         );
 
@@ -452,6 +536,151 @@ impl History {
         }
     }
 
+    // ==================== Pruning Methods ====================
+
+    /// Get the minimal full block height.
+    /// Blocks below this height are pruned or should not be downloaded.
+    pub fn minimal_full_block_height(&self) -> u32 {
+        self.minimal_full_block_height.load(Ordering::SeqCst)
+    }
+
+    /// Check if headers chain is synchronized.
+    /// Full blocks should only be downloaded after headers are synced.
+    pub fn is_headers_chain_synced(&self) -> bool {
+        self.is_headers_chain_synced.load(Ordering::SeqCst)
+    }
+
+    /// Mark headers chain as synchronized.
+    pub fn set_headers_chain_synced(&self, synced: bool) -> StateResult<()> {
+        self.is_headers_chain_synced.store(synced, Ordering::SeqCst);
+
+        // Persist to storage
+        let flag = if synced { vec![1u8] } else { vec![0u8] };
+        self.storage
+            .put(ColumnFamily::Metadata, b"is_headers_chain_synced", &flag)?;
+
+        if synced {
+            info!("Headers chain marked as synchronized");
+        }
+
+        Ok(())
+    }
+
+    /// Check if a block at the given height should be downloaded.
+    /// Returns true if headers are synced and height >= minimal_full_block_height.
+    pub fn should_download_block_at_height(&self, height: u32) -> bool {
+        self.is_headers_chain_synced() && height >= self.minimal_full_block_height()
+    }
+
+    /// Calculate the height of the voting epoch boundary at or before the given height.
+    /// Extension blocks at epoch boundaries contain protocol parameters and must be kept.
+    fn extension_with_parameters_height(height: u32) -> u32 {
+        if height < VOTING_EPOCH_LENGTH {
+            GENESIS_HEIGHT
+        } else {
+            height - (height % VOTING_EPOCH_LENGTH)
+        }
+    }
+
+    /// Update the minimal full block height after a new best full block.
+    /// This implements the pruning logic from Scala's FullBlockPruningProcessor.
+    ///
+    /// Returns the new minimal full block height.
+    pub fn update_best_full_block_pruning(&self, header: &Header) -> StateResult<u32> {
+        let new_minimal_height = if !self.pruning_config.is_enabled() {
+            // No pruning - keep all blocks from genesis
+            GENESIS_HEIGHT
+        } else {
+            let blocks_to_keep = self.pruning_config.blocks_to_keep as u32;
+            let current_minimal = self.minimal_full_block_height();
+
+            // Start from blocks_to_keep blocks back
+            let h = std::cmp::max(
+                current_minimal,
+                header.height.saturating_sub(blocks_to_keep - 1),
+            );
+
+            // But not later than the beginning of a voting epoch
+            // (we need to keep extension blocks at epoch boundaries)
+            if h > VOTING_EPOCH_LENGTH {
+                std::cmp::min(h, Self::extension_with_parameters_height(h))
+            } else {
+                h
+            }
+        };
+
+        // Update the minimal height
+        let old_minimal = self
+            .minimal_full_block_height
+            .swap(new_minimal_height, Ordering::SeqCst);
+
+        // Persist to storage
+        self.storage.put(
+            ColumnFamily::Metadata,
+            b"minimal_full_block_height",
+            &new_minimal_height.to_be_bytes(),
+        )?;
+
+        // Mark headers as synced if not already
+        if !self.is_headers_chain_synced() {
+            self.set_headers_chain_synced(true)?;
+        }
+
+        if new_minimal_height != old_minimal && self.pruning_config.is_enabled() {
+            info!(
+                old_minimal_height = old_minimal,
+                new_minimal_height = new_minimal_height,
+                best_height = header.height,
+                blocks_to_keep = self.pruning_config.blocks_to_keep,
+                "Updated minimal full block height"
+            );
+
+            // Prune old blocks if the minimal height increased
+            if new_minimal_height > old_minimal {
+                self.prune_blocks_below(new_minimal_height)?;
+            }
+        }
+
+        Ok(new_minimal_height)
+    }
+
+    /// Prune block data (transactions, extension, AD proofs) below the given height.
+    /// Headers are kept for chain verification.
+    fn prune_blocks_below(&self, height: u32) -> StateResult<()> {
+        let mut pruned_count = 0u32;
+        let mut batch = WriteBatch::new();
+
+        // Iterate through heights and prune block data
+        for h in GENESIS_HEIGHT..height {
+            // Get the block ID at this height
+            if let Some(header) = self.headers.get_by_height(h)? {
+                let block_id = header.id.0.as_ref();
+
+                // Check if block data exists before trying to delete
+                if self.blocks.has_transactions(&header.id)? {
+                    batch.delete(ColumnFamily::BlockTransactions, block_id.to_vec());
+                    batch.delete(ColumnFamily::Extensions, block_id.to_vec());
+                    batch.delete(ColumnFamily::AdProofs, block_id.to_vec());
+                    pruned_count += 1;
+                }
+            }
+        }
+
+        if pruned_count > 0 {
+            self.storage.write_batch(batch)?;
+            info!(pruned_count, below_height = height, "Pruned old block data");
+        }
+
+        Ok(())
+    }
+
+    /// Get the pruning configuration.
+    pub fn pruning_config(&self) -> &PruningConfig {
+        &self.pruning_config
+    }
+
+    // ==================== End Pruning Methods ====================
+
     /// Get cumulative difficulty for a block.
     pub fn get_cumulative_difficulty(&self, block_id: &BlockId) -> StateResult<Option<BigUint>> {
         match self
@@ -478,7 +707,7 @@ impl History {
     }
 
     /// Calculate difficulty from nBits (compact target representation).
-    fn difficulty_from_nbits(n_bits: u64) -> BigUint {
+    fn difficulty_from_nbits(n_bits: u32) -> BigUint {
         // The difficulty is the ratio of the maximum target to the current target
         nbits_to_difficulty(n_bits)
     }
@@ -984,10 +1213,150 @@ mod tests {
         (history, tmp)
     }
 
+    fn create_test_history_with_pruning(blocks_to_keep: i32) -> (History, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let config = PruningConfig::new(blocks_to_keep);
+        let history = History::with_pruning(Arc::new(db), config);
+        (history, tmp)
+    }
+
     #[test]
     fn test_init_empty() {
         let (history, _tmp) = create_test_history();
         assert_eq!(history.best_height(), 0);
         assert!(history.best_header_id().is_none());
+    }
+
+    // ============ Pruning Configuration Tests ============
+
+    #[test]
+    fn test_pruning_config_default() {
+        let config = PruningConfig::default();
+        assert_eq!(config.blocks_to_keep, -1);
+        assert!(!config.is_enabled());
+    }
+
+    #[test]
+    fn test_pruning_config_enabled() {
+        let config = PruningConfig::new(1000);
+        assert_eq!(config.blocks_to_keep, 1000);
+        assert!(config.is_enabled());
+    }
+
+    #[test]
+    fn test_pruning_config_zero_is_enabled() {
+        // Zero blocks to keep is still considered "enabled" (keep nothing)
+        let config = PruningConfig::new(0);
+        assert!(config.is_enabled());
+    }
+
+    // ============ History Pruning State Tests ============
+
+    #[test]
+    fn test_history_default_no_pruning() {
+        let (history, _tmp) = create_test_history();
+        assert!(!history.pruning_config().is_enabled());
+        assert_eq!(history.minimal_full_block_height(), GENESIS_HEIGHT);
+        assert!(!history.is_headers_chain_synced());
+    }
+
+    #[test]
+    fn test_history_with_pruning_enabled() {
+        let (history, _tmp) = create_test_history_with_pruning(1000);
+        assert!(history.pruning_config().is_enabled());
+        assert_eq!(history.pruning_config().blocks_to_keep, 1000);
+    }
+
+    #[test]
+    fn test_set_headers_chain_synced() {
+        let (history, _tmp) = create_test_history();
+
+        assert!(!history.is_headers_chain_synced());
+
+        history.set_headers_chain_synced(true).unwrap();
+        assert!(history.is_headers_chain_synced());
+
+        history.set_headers_chain_synced(false).unwrap();
+        assert!(!history.is_headers_chain_synced());
+    }
+
+    #[test]
+    fn test_should_download_block_at_height() {
+        let (history, _tmp) = create_test_history_with_pruning(100);
+
+        // Headers not synced yet - should not download
+        assert!(!history.should_download_block_at_height(1));
+        assert!(!history.should_download_block_at_height(1000));
+
+        // Mark headers as synced
+        history.set_headers_chain_synced(true).unwrap();
+
+        // Now should download blocks >= minimal height (default is 1)
+        assert!(history.should_download_block_at_height(1));
+        assert!(history.should_download_block_at_height(1000));
+    }
+
+    // ============ Extension Height Calculation Tests ============
+
+    #[test]
+    fn test_extension_with_parameters_height() {
+        // Below epoch length - returns genesis
+        assert_eq!(
+            History::extension_with_parameters_height(500),
+            GENESIS_HEIGHT
+        );
+        assert_eq!(
+            History::extension_with_parameters_height(1023),
+            GENESIS_HEIGHT
+        );
+
+        // At epoch boundary
+        assert_eq!(History::extension_with_parameters_height(1024), 1024);
+        assert_eq!(History::extension_with_parameters_height(2048), 2048);
+
+        // Between epochs - rounds down to epoch boundary
+        assert_eq!(History::extension_with_parameters_height(1500), 1024);
+        assert_eq!(History::extension_with_parameters_height(2500), 2048);
+        assert_eq!(History::extension_with_parameters_height(3000), 2048);
+    }
+
+    // ============ Persistence Tests ============
+
+    #[test]
+    fn test_pruning_state_persistence() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create history, set state, close
+        {
+            let db = Database::open(tmp.path()).unwrap();
+            let config = PruningConfig::new(500);
+            let history = History::with_pruning(Arc::new(db), config);
+
+            history.set_headers_chain_synced(true).unwrap();
+
+            // Manually update minimal height for test
+            history
+                .minimal_full_block_height
+                .store(100, Ordering::SeqCst);
+            history
+                .storage
+                .put(
+                    ColumnFamily::Metadata,
+                    b"minimal_full_block_height",
+                    &100u32.to_be_bytes(),
+                )
+                .unwrap();
+        }
+
+        // Reopen and verify state is restored
+        {
+            let db = Database::open(tmp.path()).unwrap();
+            let config = PruningConfig::new(500);
+            let history = History::init_from_storage_with_pruning(Arc::new(db), config).unwrap();
+
+            assert!(history.is_headers_chain_synced());
+            assert_eq!(history.minimal_full_block_height(), 100);
+        }
     }
 }
