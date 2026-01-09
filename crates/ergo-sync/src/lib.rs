@@ -23,9 +23,8 @@ pub use sync::{SyncConfig, SyncState, Synchronizer};
 pub const HEADERS_BATCH_SIZE: usize = 100;
 
 /// Maximum number of blocks to download in parallel.
-/// Increased from 64 to 256 for better multi-peer utilization.
-/// With ~25 connected peers at 8-12 blocks each, we need capacity for 200-300 blocks.
-pub const PARALLEL_DOWNLOADS: usize = 256;
+/// Capped at 64 to prevent request flooding when blocks aren't being received.
+pub const PARALLEL_DOWNLOADS: usize = 64;
 
 /// Maximum blocks to keep in download queue.
 /// Increased to support higher parallel download capacity.

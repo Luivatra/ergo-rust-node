@@ -6,7 +6,10 @@
 //! 3. Download and validate full blocks
 //! 4. Apply blocks to state
 
-use crate::{BlockDownloader, DownloadTask, SyncConfig, SyncError, SyncResult, Synchronizer};
+use crate::{
+    BlockDownloader, DownloadTask, SyncConfig, SyncError, SyncResult, Synchronizer,
+    PARALLEL_DOWNLOADS,
+};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use ergo_chain_types::{BlockId, Digest32, Header};
@@ -1527,6 +1530,17 @@ impl SyncProtocol {
     /// Dispatch pending downloads to peers.
     /// Distributes blocks across ALL available peers for parallel downloading.
     async fn dispatch_downloads(&self) -> SyncResult<()> {
+        // Check if we already have too many requests in flight
+        // This prevents request flooding when blocks aren't being received
+        let stats = self.downloader.stats();
+        if stats.in_flight >= PARALLEL_DOWNLOADS {
+            debug!(
+                in_flight = stats.in_flight,
+                "Too many requests in flight, waiting for responses"
+            );
+            return Ok(());
+        }
+
         // Get ALL available peers that can receive requests (respecting rate limits)
         let available_peers: Vec<PeerId> = {
             let peers = self.sync_peers.read();
