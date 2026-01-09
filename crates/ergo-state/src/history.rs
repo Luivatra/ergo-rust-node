@@ -49,29 +49,79 @@ impl HeaderStore {
         Self { storage }
     }
 
-    /// Store a header.
-    pub fn put(&self, header: &Header) -> StateResult<()> {
+    /// Store a header using raw bytes (batched version).
+    /// This preserves the original serialization to ensure correct ID computation on retrieval.
+    pub fn put_with_bytes_batched(
+        &self,
+        batch: &mut WriteBatch,
+        header: &Header,
+        raw_bytes: &[u8],
+    ) {
+        let id = header.id.0.as_ref();
+
+        // Store the ORIGINAL bytes, not re-serialized bytes
+        batch.put(columns::HEADERS, id.to_vec(), raw_bytes.to_vec());
+
+        // Store height -> block_id index
+        let height_key = header.height.to_be_bytes();
+        batch.put(columns::HEADER_CHAIN, height_key.to_vec(), id.to_vec());
+    }
+
+    /// Store a header using raw bytes.
+    /// This preserves the original serialization to ensure correct ID computation on retrieval.
+    /// The header's ID field should already be set to the correct ID (computed from raw_bytes).
+    pub fn put_with_bytes(&self, header: &Header, raw_bytes: &[u8]) -> StateResult<()> {
+        let mut batch = WriteBatch::new();
+        self.put_with_bytes_batched(&mut batch, header, raw_bytes);
+        self.storage.write_batch(batch)?;
+        Ok(())
+    }
+
+    /// Store a header (batched version).
+    pub fn put_batched(&self, batch: &mut WriteBatch, header: &Header) -> StateResult<()> {
         let id = header.id.0.as_ref();
         let bytes = header
             .scorex_serialize_bytes()
             .map_err(|e| StateError::Serialization(e.to_string()))?;
 
-        // Store header bytes
-        self.storage.put(columns::HEADERS, id, &bytes)?;
-
-        // Store height -> block_id index
+        batch.put(columns::HEADERS, id.to_vec(), bytes);
         let height_key = header.height.to_be_bytes();
-        self.storage.put(columns::HEADER_CHAIN, &height_key, id)?;
-
+        batch.put(columns::HEADER_CHAIN, height_key.to_vec(), id.to_vec());
         Ok(())
+    }
+
+    /// Store a header (legacy method - uses re-serialization).
+    /// Prefer put_with_bytes when original bytes are available.
+    pub fn put(&self, header: &Header) -> StateResult<()> {
+        let mut batch = WriteBatch::new();
+        self.put_batched(&mut batch, header)?;
+        self.storage.write_batch(batch)?;
+        Ok(())
+    }
+
+    /// Compute the correct header ID from raw bytes using blake2b-256.
+    /// This is needed because sigma-rust's deserialization can produce wrong IDs
+    /// due to BigInt serialization differences in Autolykos v1 headers.
+    fn compute_header_id(data: &[u8]) -> [u8; 32] {
+        use blake2::digest::consts::U32;
+        use blake2::{Blake2b, Digest};
+        let mut hasher = Blake2b::<U32>::new();
+        hasher.update(data);
+        let result = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&result);
+        arr
     }
 
     /// Get a header by ID.
     pub fn get(&self, id: &BlockId) -> StateResult<Option<Header>> {
         match self.storage.get(columns::HEADERS, id.0.as_ref())? {
             Some(bytes) => {
-                let header = Header::scorex_parse_bytes(&bytes)
+                let mut header = Header::scorex_parse_bytes(&bytes)
                     .map_err(|e| StateError::Serialization(e.to_string()))?;
+                // Fix the header ID - compute from stored bytes to handle BigInt serialization issues
+                let correct_id = Self::compute_header_id(&bytes);
+                header.id = BlockId(Digest32::from(correct_id));
                 Ok(Some(header))
             }
             None => Ok(None),
@@ -124,10 +174,8 @@ impl BlockStore {
         Self { storage }
     }
 
-    /// Store block transactions.
-    pub fn put_transactions(&self, block_id: &BlockId, txs: &BlockTransactions) -> StateResult<()> {
-        // Serialize transactions
-        // For now, use a simple format: count (4 bytes) + concatenated tx bytes
+    /// Serialize block transactions to bytes.
+    fn serialize_transactions(txs: &BlockTransactions) -> StateResult<Vec<u8>> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(txs.txs.len() as u32).to_be_bytes());
 
@@ -138,7 +186,24 @@ impl BlockStore {
             bytes.extend_from_slice(&(tx_bytes.len() as u32).to_be_bytes());
             bytes.extend_from_slice(&tx_bytes);
         }
+        Ok(bytes)
+    }
 
+    /// Store block transactions (batched version).
+    pub fn put_transactions_batched(
+        &self,
+        batch: &mut WriteBatch,
+        block_id: &BlockId,
+        txs: &BlockTransactions,
+    ) -> StateResult<()> {
+        let bytes = Self::serialize_transactions(txs)?;
+        batch.put(columns::BLOCK_TXS, block_id.0.as_ref().to_vec(), bytes);
+        Ok(())
+    }
+
+    /// Store block transactions.
+    pub fn put_transactions(&self, block_id: &BlockId, txs: &BlockTransactions) -> StateResult<()> {
+        let bytes = Self::serialize_transactions(txs)?;
         self.storage
             .put(columns::BLOCK_TXS, block_id.0.as_ref(), &bytes)?;
         Ok(())
@@ -191,9 +256,8 @@ impl BlockStore {
             .contains(columns::BLOCK_TXS, block_id.0.as_ref())?)
     }
 
-    /// Store extension.
-    pub fn put_extension(&self, extension: &Extension) -> StateResult<()> {
-        // Serialize extension fields
+    /// Serialize extension to bytes.
+    fn serialize_extension(extension: &Extension) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(extension.fields.len() as u32).to_be_bytes());
 
@@ -202,13 +266,37 @@ impl BlockStore {
             bytes.extend_from_slice(&(field.value.len() as u16).to_be_bytes());
             bytes.extend_from_slice(&field.value);
         }
+        bytes
+    }
 
+    /// Store extension (batched version).
+    pub fn put_extension_batched(&self, batch: &mut WriteBatch, extension: &Extension) {
+        let bytes = Self::serialize_extension(extension);
+        batch.put(
+            ColumnFamily::Extensions,
+            extension.header_id.0.as_ref().to_vec(),
+            bytes,
+        );
+    }
+
+    /// Store extension.
+    pub fn put_extension(&self, extension: &Extension) -> StateResult<()> {
+        let bytes = Self::serialize_extension(extension);
         self.storage.put(
             ColumnFamily::Extensions,
             extension.header_id.0.as_ref(),
             &bytes,
         )?;
         Ok(())
+    }
+
+    /// Store AD proofs (batched version).
+    pub fn put_ad_proofs_batched(&self, batch: &mut WriteBatch, proofs: &ADProofs) {
+        batch.put(
+            ColumnFamily::AdProofs,
+            proofs.header_id.0.as_ref().to_vec(),
+            proofs.proof_bytes.clone(),
+        );
     }
 
     /// Store AD proofs.
@@ -398,6 +486,24 @@ impl History {
     /// Append a new header.
     #[instrument(skip(self, header), fields(height = header.height, id = %header.id))]
     pub fn append_header(&self, header: Header) -> StateResult<ChainSelection> {
+        self.append_header_internal(header, None)
+    }
+
+    /// Append a header to the chain using the original raw bytes.
+    /// This preserves correct ID computation for headers with BigInt serialization issues.
+    pub fn append_header_with_bytes(
+        &self,
+        header: Header,
+        raw_bytes: &[u8],
+    ) -> StateResult<ChainSelection> {
+        self.append_header_internal(header, Some(raw_bytes))
+    }
+
+    fn append_header_internal(
+        &self,
+        header: Header,
+        raw_bytes: Option<&[u8]>,
+    ) -> StateResult<ChainSelection> {
         let header_id = header.id.clone();
         let parent_id = header.parent_id.clone();
         let height = header.height;
@@ -426,8 +532,12 @@ impl History {
         };
         let cumulative_difficulty = &parent_cumulative + &block_difficulty;
 
-        // Store the header
-        self.headers.put(&header)?;
+        // Store the header - use raw bytes if available for correct ID preservation
+        if let Some(bytes) = raw_bytes {
+            self.headers.put_with_bytes(&header, bytes)?;
+        } else {
+            self.headers.put(&header)?;
+        }
 
         // Store cumulative difficulty for this block
         let mut batch = WriteBatch::new();
@@ -539,27 +649,79 @@ impl History {
         Ok(1)
     }
 
-    /// Append a full block.
+    /// Append a full block using a single batched write for all data.
+    /// This is more efficient than append_full_block as it minimizes disk I/O.
     pub fn append_full_block(&self, block: FullBlock) -> StateResult<ChainSelection> {
         let block_id = block.id();
         let height = block.height();
+        let header = block.header.clone();
 
-        // First append the header
-        let selection = self.append_header(block.header)?;
+        // Create a single batch for ALL block data
+        let mut batch = WriteBatch::new();
 
-        // Store block sections
+        // Add header to batch
+        self.headers.put_batched(&mut batch, &header)?;
+
+        // Add cumulative difficulty
+        let parent_id = header.parent_id.clone();
+        let block_difficulty = Self::difficulty_from_nbits(header.n_bits);
+        let parent_cumulative = if height <= 2 {
+            BigUint::from(0u32)
+        } else {
+            self.get_cumulative_difficulty(&parent_id)?
+                .unwrap_or_else(|| BigUint::from(0u32))
+        };
+        let cumulative_difficulty = &parent_cumulative + &block_difficulty;
+        self.store_cumulative_difficulty(&mut batch, &block_id, &cumulative_difficulty);
+
+        // Add block sections to batch
         self.blocks
-            .put_transactions(&block_id, &block.transactions)?;
-        self.blocks.put_extension(&block.extension)?;
+            .put_transactions_batched(&mut batch, &block_id, &block.transactions)?;
+        self.blocks
+            .put_extension_batched(&mut batch, &block.extension);
 
         if let Some(ad_proofs) = &block.ad_proofs {
-            self.blocks.put_ad_proofs(ad_proofs)?;
+            self.blocks.put_ad_proofs_batched(&mut batch, ad_proofs);
         }
+
+        // Determine chain selection
+        let current_best_difficulty = self.best_cumulative_difficulty();
+        let current_height = self.best_height();
+
+        let selection = if cumulative_difficulty > current_best_difficulty {
+            // Update best header metadata
+            batch.put(
+                ColumnFamily::Metadata,
+                b"best_header_id",
+                block_id.0.as_ref().to_vec(),
+            );
+            batch.put(
+                ColumnFamily::Metadata,
+                b"best_height",
+                height.to_be_bytes().to_vec(),
+            );
+            batch.put(
+                ColumnFamily::Metadata,
+                b"best_cumulative_difficulty",
+                cumulative_difficulty.to_bytes_be(),
+            );
+
+            if height <= current_height && current_height > 0 {
+                ChainSelection::Reorg {
+                    fork_height: 1, // Will be computed after batch write
+                    rollback_count: current_height - 1,
+                }
+            } else {
+                ChainSelection::Extended
+            }
+        } else {
+            ChainSelection::Ignored
+        };
 
         // Update best full block if this extends it
         let current_full_height = self.best_full_block_height();
-        if height > current_full_height {
-            let mut batch = WriteBatch::new();
+        let update_full_block = height > current_full_height;
+        if update_full_block {
             batch.put(
                 ColumnFamily::Metadata,
                 b"best_full_block_id",
@@ -570,15 +732,161 @@ impl History {
                 b"best_full_block_height",
                 height.to_be_bytes().to_vec(),
             );
-            self.storage.write_batch(batch)?;
+        }
 
+        // Execute single batch write for all data
+        self.storage.write_batch(batch)?;
+
+        // Update in-memory state after successful write
+        if cumulative_difficulty > current_best_difficulty {
+            *self.best_header_id.write() = Some(block_id.clone());
+            *self.best_height.write() = height;
+            *self.best_cumulative_difficulty.write() = cumulative_difficulty;
+        }
+
+        if update_full_block {
             *self.best_full_block_id.write() = Some(block_id.clone());
             *self.best_full_block_height.write() = height;
-
             info!(height, %block_id, "New best full block");
         }
 
         Ok(selection)
+    }
+
+    /// Add a full block's data to an external batch without executing it.
+    /// Returns the cumulative difficulty for this block.
+    /// Call `finalize_block_batch` after adding all blocks to commit and update in-memory state.
+    pub fn add_block_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        block: &FullBlock,
+        parent_cumulative: &BigUint,
+    ) -> StateResult<BigUint> {
+        let block_id = block.id();
+        let header = &block.header;
+
+        // Add header to batch
+        self.headers.put_batched(batch, header)?;
+
+        // Calculate and store cumulative difficulty
+        let block_difficulty = Self::difficulty_from_nbits(header.n_bits);
+        let cumulative_difficulty = parent_cumulative + &block_difficulty;
+        self.store_cumulative_difficulty(batch, &block_id, &cumulative_difficulty);
+
+        // Add block sections to batch
+        self.blocks
+            .put_transactions_batched(batch, &block_id, &block.transactions)?;
+        self.blocks.put_extension_batched(batch, &block.extension);
+
+        if let Some(ad_proofs) = &block.ad_proofs {
+            self.blocks.put_ad_proofs_batched(batch, ad_proofs);
+        }
+
+        Ok(cumulative_difficulty)
+    }
+
+    /// Finalize a batch of blocks by adding metadata updates and executing the batch.
+    /// Updates in-memory state after successful write.
+    pub fn finalize_block_batch(
+        &self,
+        mut batch: WriteBatch,
+        final_block_id: &BlockId,
+        final_height: u32,
+        final_cumulative_difficulty: &BigUint,
+    ) -> StateResult<ChainSelection> {
+        let current_best_difficulty = self.best_cumulative_difficulty();
+        let current_height = self.best_height();
+
+        let selection = if final_cumulative_difficulty > &current_best_difficulty {
+            // Update best header metadata
+            batch.put(
+                ColumnFamily::Metadata,
+                b"best_header_id",
+                final_block_id.0.as_ref().to_vec(),
+            );
+            batch.put(
+                ColumnFamily::Metadata,
+                b"best_height",
+                final_height.to_be_bytes().to_vec(),
+            );
+            batch.put(
+                ColumnFamily::Metadata,
+                b"best_cumulative_difficulty",
+                final_cumulative_difficulty.to_bytes_be(),
+            );
+
+            if final_height <= current_height && current_height > 0 {
+                ChainSelection::Reorg {
+                    fork_height: 1,
+                    rollback_count: current_height - 1,
+                }
+            } else {
+                ChainSelection::Extended
+            }
+        } else {
+            ChainSelection::Ignored
+        };
+
+        // Update best full block metadata
+        let current_full_height = self.best_full_block_height();
+        let update_full_block = final_height > current_full_height;
+        if update_full_block {
+            batch.put(
+                ColumnFamily::Metadata,
+                b"best_full_block_id",
+                final_block_id.0.as_ref().to_vec(),
+            );
+            batch.put(
+                ColumnFamily::Metadata,
+                b"best_full_block_height",
+                final_height.to_be_bytes().to_vec(),
+            );
+        }
+
+        // Execute the batch
+        self.storage.write_batch(batch)?;
+
+        // Update in-memory state
+        if final_cumulative_difficulty > &current_best_difficulty {
+            *self.best_header_id.write() = Some(final_block_id.clone());
+            *self.best_height.write() = final_height;
+            *self.best_cumulative_difficulty.write() = final_cumulative_difficulty.clone();
+        }
+
+        if update_full_block {
+            *self.best_full_block_id.write() = Some(final_block_id.clone());
+            *self.best_full_block_height.write() = final_height;
+            info!(final_height, %final_block_id, "New best full block (batched)");
+        }
+
+        Ok(selection)
+    }
+
+    /// Execute a write batch directly (for combined history+utxo batches).
+    pub fn execute_batch(&self, batch: WriteBatch) -> StateResult<()> {
+        self.storage.write_batch(batch)?;
+        Ok(())
+    }
+
+    /// Update in-memory state after a successful batched write.
+    pub fn update_in_memory_state(
+        &self,
+        block_id: BlockId,
+        height: u32,
+        cumulative_difficulty: BigUint,
+    ) {
+        let current_best = self.best_cumulative_difficulty();
+        if cumulative_difficulty > current_best {
+            *self.best_header_id.write() = Some(block_id.clone());
+            *self.best_height.write() = height;
+            *self.best_cumulative_difficulty.write() = cumulative_difficulty;
+        }
+
+        let current_full = self.best_full_block_height();
+        if height > current_full {
+            *self.best_full_block_id.write() = Some(block_id);
+            *self.best_full_block_height.write() = height;
+        }
     }
 
     /// Get a full block by ID.

@@ -20,6 +20,8 @@ pub struct DownloadTask {
     pub requested_at: Option<Instant>,
     /// Retry count.
     pub retries: u32,
+    /// Peers that failed to deliver this block (for blacklisting).
+    pub failed_peers: HashSet<PeerId>,
 }
 
 impl DownloadTask {
@@ -31,7 +33,13 @@ impl DownloadTask {
             peer: None,
             requested_at: None,
             retries: 0,
+            failed_peers: HashSet::new(),
         }
+    }
+
+    /// Check if a peer has already failed to deliver this block.
+    pub fn peer_failed(&self, peer: &PeerId) -> bool {
+        self.failed_peers.contains(peer)
     }
 
     /// Check if task has timed out.
@@ -57,8 +65,9 @@ impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
             max_parallel: PARALLEL_DOWNLOADS,
-            timeout: Duration::from_secs(30),
-            max_retries: 3,
+            // Reduced from 30s to 10s for faster detection of stuck downloads
+            timeout: Duration::from_secs(10),
+            max_retries: 5,
         }
     }
 }
@@ -90,14 +99,33 @@ impl BlockDownloader {
     }
 
     /// Add tasks to download queue.
+    /// Skips tasks that are already completed, pending, or in-flight.
     pub fn queue(&self, tasks: Vec<DownloadTask>) {
         let mut pending = self.pending.write();
+        let in_flight = self.in_flight.read();
+        let completed = self.completed.read();
+        let mut added = 0;
         for task in tasks {
-            if !self.completed.read().contains(&task.id) {
-                pending.insert(task.id.clone(), task);
+            // Skip if already completed, pending, or in-flight
+            if completed.contains(&task.id) {
+                continue;
             }
+            if in_flight.contains_key(&task.id) {
+                continue;
+            }
+            if pending.contains_key(&task.id) {
+                continue;
+            }
+            pending.insert(task.id.clone(), task);
+            added += 1;
         }
-        debug!(queued = pending.len(), "Tasks queued for download");
+        if added > 0 {
+            debug!(
+                added,
+                total_pending = pending.len(),
+                "Tasks queued for download"
+            );
+        }
     }
 
     /// Get tasks ready to dispatch.
@@ -113,6 +141,49 @@ impl BlockDownloader {
             .take(take)
             .cloned()
             .collect()
+    }
+
+    /// Get tasks ready to dispatch to a specific peer (excluding failed peers).
+    pub fn get_ready_tasks_for_peer(&self, count: usize, peer: &PeerId) -> Vec<DownloadTask> {
+        let in_flight_count = self.in_flight.read().len();
+        let available = self.config.max_parallel.saturating_sub(in_flight_count);
+        let take = count.min(available);
+
+        let pending = self.pending.read();
+        pending
+            .values()
+            .filter(|t| t.peer.is_none() && !t.peer_failed(peer))
+            .take(take)
+            .cloned()
+            .collect()
+    }
+
+    /// Check if there are any tasks that can't be dispatched to any available peer.
+    /// Returns IDs of tasks that have failed with all provided peers.
+    pub fn get_stuck_tasks(&self, available_peers: &[PeerId]) -> Vec<Vec<u8>> {
+        if available_peers.is_empty() {
+            return Vec::new();
+        }
+
+        let pending = self.pending.read();
+        pending
+            .values()
+            .filter(|t| t.peer.is_none() && available_peers.iter().all(|p| t.peer_failed(p)))
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// Clear failed peers for a task, allowing it to be retried with any peer.
+    /// Used when a task is stuck because all available peers have failed.
+    pub fn clear_failed_peers(&self, id: &[u8]) {
+        if let Some(task) = self.pending.write().get_mut(id) {
+            debug!(
+                id = hex::encode(id),
+                was_failed_peers = task.failed_peers.len(),
+                "Clearing failed peers for stuck task"
+            );
+            task.failed_peers.clear();
+        }
     }
 
     /// Mark a task as dispatched to a peer.
@@ -136,24 +207,30 @@ impl BlockDownloader {
     pub fn fail(&self, id: &[u8], peer: &PeerId) {
         self.in_flight.write().remove(id);
 
-        if let Some(mut task) = self.pending.write().get_mut(id) {
+        let mut pending = self.pending.write();
+        if let Some(task) = pending.get_mut(id) {
             task.retries += 1;
             task.peer = None;
             task.requested_at = None;
+            // Track this peer as having failed for this block
+            task.failed_peers.insert(peer.clone());
 
             if task.retries >= self.config.max_retries {
                 warn!(
                     id = hex::encode(id),
                     retries = task.retries,
+                    failed_peers = task.failed_peers.len(),
                     "Download failed permanently"
                 );
-                self.pending.write().remove(id);
+                pending.remove(id);
+                drop(pending);
                 self.failed.write().insert(id.to_vec());
             } else {
                 debug!(
                     id = hex::encode(id),
                     retries = task.retries,
-                    "Download will retry"
+                    failed_peers = task.failed_peers.len(),
+                    "Download will retry with different peer if available"
                 );
             }
         }
@@ -168,8 +245,25 @@ impl BlockDownloader {
             if task.is_timed_out(self.config.timeout) {
                 if let Some(peer) = &task.peer {
                     timed_out.push((id.clone(), peer.clone()));
+                    debug!(
+                        id = hex::encode(id),
+                        elapsed_secs = task
+                            .requested_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0),
+                        retries = task.retries,
+                        "Block download timed out"
+                    );
                 }
             }
+        }
+
+        if !timed_out.is_empty() {
+            warn!(
+                count = timed_out.len(),
+                pending = pending.len(),
+                "Found timed out block downloads"
+            );
         }
 
         timed_out

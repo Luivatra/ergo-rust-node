@@ -8,7 +8,8 @@
 
 use crate::{
     ConnectionConfig, Handshake, HandshakeCodec, HandshakeData, Message, MessageCodec,
-    NetworkError, NetworkResult, PeerId, PeerInfo, PeerManager, MAINNET_MAGIC, PROTOCOL_VERSION,
+    NetworkError, NetworkResult, PeerId, PeerInfo, PeerManager, PeerState, MAINNET_MAGIC,
+    PROTOCOL_VERSION,
 };
 use futures::stream::StreamExt;
 use futures::SinkExt;
@@ -271,7 +272,7 @@ impl NetworkService {
         // Clone the sender before releasing the lock to avoid holding it across await
         let tx = self.peers.read().get(peer_id).map(|h| h.tx.clone());
         if let Some(tx) = tx {
-            info!(peer = %peer_id, msg = ?message.message_type(), "Sending message to peer");
+            debug!(peer = %peer_id, msg = ?message.message_type(), "Sending message to peer");
             if let Err(e) = tx.send(message).await {
                 warn!(peer = %peer_id, error = %e, "Failed to send message");
             }
@@ -306,7 +307,7 @@ async fn handle_peer_connection(
     config: NetworkConfig,
     peers: Arc<RwLock<HashMap<PeerId, PeerHandle>>>,
     event_tx: mpsc::Sender<NetworkEvent>,
-    _peer_manager: Arc<PeerManager>,
+    peer_manager: Arc<PeerManager>,
     is_outgoing: bool,
 ) -> NetworkResult<()> {
     // Perform raw handshake (no framing)
@@ -383,9 +384,13 @@ async fn handle_peer_connection(
         peer_id.clone(),
         PeerHandle {
             tx,
-            info: peer_info,
+            info: peer_info.clone(),
         },
     );
+
+    // Update peer manager - add peer and mark as connected
+    peer_manager.add_peer(peer_info);
+    peer_manager.set_state(&peer_id, PeerState::Connected);
 
     // Emit connected event
     let _ = event_tx
@@ -406,7 +411,7 @@ async fn handle_peer_connection(
             result = stream.next() => {
                 match result {
                     Some(Ok(message)) => {
-                        info!(peer = %peer_id, msg = ?message.message_type(), "Received message");
+                        debug!(peer = %peer_id, msg = ?message.message_type(), "Received message");
                         let _ = event_tx.send(NetworkEvent::MessageReceived {
                             peer_id: peer_id.clone(),
                             message,
@@ -435,6 +440,10 @@ async fn handle_peer_connection(
 
     // Clean up
     peers.write().remove(&peer_id);
+
+    // Update peer manager - mark as disconnected
+    peer_manager.set_state(&peer_id, PeerState::Disconnected);
+
     let _ = event_tx
         .send(NetworkEvent::PeerDisconnected {
             peer_id: peer_id.clone(),

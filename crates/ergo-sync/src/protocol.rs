@@ -7,14 +7,45 @@
 //! 4. Apply blocks to state
 
 use crate::{BlockDownloader, DownloadTask, SyncConfig, SyncError, SyncResult, Synchronizer};
-use ergo_chain_types::{BlockId, Header};
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
+use ergo_chain_types::{BlockId, Digest32, Header};
 use ergo_consensus::block::ModifierType;
 use ergo_network::{InvData, Message, ModifierRequest, PeerId, SyncInfo};
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
+
+/// Compute the Blake2b-256 hash of header bytes to get the correct header ID.
+/// This is needed because sigma-rust's Header::scorex_parse_bytes() computes the ID
+/// from reserialized bytes, which can differ from original bytes due to BigInt
+/// serialization issues (leading 0xFF bytes being stripped).
+fn compute_header_id(data: &[u8]) -> Vec<u8> {
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
+/// Compute the ID for a non-header block section (BlockTransactions, Extension, ADProofs).
+///
+/// In the Ergo protocol, block sections have a derived ID computed as:
+/// `blake2b256(modifierTypeId ++ headerId ++ sectionDigest)`
+///
+/// This is NOT the same as the header ID! The Scala node uses this derived ID
+/// when sending Inv messages and expecting RequestModifier requests.
+///
+/// For BlockTransactions: sectionDigest = header.transactionsRoot
+/// For Extension: sectionDigest = header.extensionRoot
+/// For ADProofs: sectionDigest = header.adProofsRoot
+fn compute_block_section_id(modifier_type: u8, header_id: &[u8], section_digest: &[u8]) -> Vec<u8> {
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(&[modifier_type]);
+    hasher.update(header_id);
+    hasher.update(section_digest);
+    hasher.finalize().to_vec()
+}
 
 /// Messages that the sync service can send.
 #[derive(Debug)]
@@ -26,6 +57,8 @@ pub enum SyncCommand {
     /// Store a received header (with response channel for confirmation).
     StoreHeader {
         header: Header,
+        /// Raw bytes from network - needed for correct ID computation.
+        raw_bytes: Vec<u8>,
         response_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// Request to apply a validated block.
@@ -57,17 +90,35 @@ pub enum SyncEvent {
     BlockApplied { block_id: Vec<u8>, height: u32 },
     /// Block application failed.
     BlockFailed { block_id: Vec<u8>, error: String },
+    /// Request to download blocks for these headers.
+    /// The node sends this with headers for blocks it needs (based on UTXO height).
+    RequestBlocks { headers: Vec<Header> },
     /// Periodic tick for housekeeping.
     Tick,
 }
+
+/// Maximum number of headers to keep in memory.
+/// Headers older than this are dropped to save memory.
+/// With ~500 bytes per header, 10000 headers = ~5MB.
+const MAX_CACHED_HEADERS: usize = 10_000;
+
+/// Maximum number of block IDs to track for download.
+/// This limits memory used by missing_blocks and tx_id_to_header_id.
+const MAX_PENDING_BLOCKS: usize = 10_000;
 
 /// Header chain segment for tracking sync progress.
 #[derive(Debug, Clone)]
 struct HeaderChain {
     /// Headers we've received but not yet have blocks for.
+    /// Limited to MAX_CACHED_HEADERS to prevent unbounded memory growth.
     headers: VecDeque<Header>,
-    /// Block IDs we need to download.
+    /// BlockTransactions IDs we need to download.
+    /// These are DERIVED IDs: blake2b256(typeId ++ headerId ++ transactionsRoot)
+    /// NOT the same as header IDs!
     missing_blocks: VecDeque<Vec<u8>>,
+    /// Mapping from transactionsId -> headerId for matching received blocks.
+    /// When we receive a block, we need to find the corresponding header.
+    tx_id_to_header_id: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl HeaderChain {
@@ -75,7 +126,43 @@ impl HeaderChain {
         Self {
             headers: VecDeque::new(),
             missing_blocks: VecDeque::new(),
+            tx_id_to_header_id: HashMap::new(),
         }
+    }
+
+    /// Add a header and its block ID, enforcing memory limits.
+    fn add_header(&mut self, header: Header, transactions_id: Vec<u8>, header_id: Vec<u8>) {
+        // Add the new entries
+        self.headers.push_back(header);
+        self.missing_blocks.push_back(transactions_id.clone());
+        self.tx_id_to_header_id.insert(transactions_id, header_id);
+
+        // Trim old entries if we exceed limits
+        self.enforce_limits();
+    }
+
+    /// Remove old entries to enforce memory limits.
+    fn enforce_limits(&mut self) {
+        // Trim headers
+        while self.headers.len() > MAX_CACHED_HEADERS {
+            self.headers.pop_front();
+        }
+
+        // Trim missing_blocks and corresponding mappings
+        while self.missing_blocks.len() > MAX_PENDING_BLOCKS {
+            if let Some(old_tx_id) = self.missing_blocks.pop_front() {
+                self.tx_id_to_header_id.remove(&old_tx_id);
+            }
+        }
+    }
+
+    /// Get memory usage statistics.
+    fn memory_stats(&self) -> (usize, usize, usize) {
+        (
+            self.headers.len(),
+            self.missing_blocks.len(),
+            self.tx_id_to_header_id.len(),
+        )
     }
 }
 
@@ -84,6 +171,8 @@ impl HeaderChain {
 struct PendingHeader {
     /// The header itself.
     header: Header,
+    /// Raw bytes from network - needed for correct ID computation on storage.
+    raw_bytes: Vec<u8>,
     /// Parent ID we're waiting for.
     parent_id: Vec<u8>,
 }
@@ -91,6 +180,9 @@ struct PendingHeader {
 /// Maximum number of headers to include in V2 SyncInfo.
 /// The Scala node uses `ErgoSyncInfo.MaxBlockIds = 10` for V2.
 const MAX_V2_HEADERS: usize = 10;
+
+/// V2 SyncInfo offsets from best height (matches Scala node's FullV2SyncOffsets).
+const V2_SYNC_OFFSETS: [u32; 4] = [0, 16, 128, 512];
 
 /// Sync protocol handler.
 pub struct SyncProtocol {
@@ -102,6 +194,9 @@ pub struct SyncProtocol {
     our_best_headers: RwLock<Vec<Vec<u8>>>,
     /// Headers we're tracking.
     header_chain: RwLock<HeaderChain>,
+    /// Headers for V2 SyncInfo at offsets [0, 16, 128, 512] from best height.
+    /// Stored in newest-first order (best header at index 0).
+    v2_sync_headers: RwLock<Vec<Header>>,
     /// Peers we're syncing from.
     sync_peers: RwLock<HashMap<PeerId, PeerSyncState>>,
     /// Headers pending storage (waiting for parent).
@@ -189,6 +284,7 @@ impl SyncProtocol {
             downloader: Arc::new(BlockDownloader::default()),
             our_best_headers: RwLock::new(Vec::new()),
             header_chain: RwLock::new(HeaderChain::new()),
+            v2_sync_headers: RwLock::new(Vec::new()),
             sync_peers: RwLock::new(HashMap::new()),
             pending_headers: RwLock::new(HashMap::new()),
             stored_headers: RwLock::new(stored),
@@ -210,22 +306,22 @@ impl SyncProtocol {
     /// # Arguments
     /// * `all_header_ids` - All stored header IDs (for tracking which headers we have)
     /// * `locator_ids` - Exponentially spaced header IDs for SyncInfo messages
-    /// * `recent_headers` - Most recent headers (for V2 SyncInfo) - should be the last MAX_V2_HEADERS
+    /// * `v2_headers` - Headers at V2 SyncInfo offsets [0, 16, 128, 512] from best height (newest first)
     pub fn init_from_stored_headers(
         &self,
         all_header_ids: Vec<Vec<u8>>,
         locator_ids: Vec<Vec<u8>>,
-        recent_headers: Vec<Header>,
+        v2_headers: Vec<Header>,
     ) {
         if all_header_ids.is_empty() {
             return;
         }
 
         info!(
-            "Initializing sync protocol with {} stored headers, {} locator headers, {} recent headers for V2",
+            "Initializing sync protocol with {} stored headers, {} locator headers, {} V2 sync headers",
             all_header_ids.len(),
             locator_ids.len(),
-            recent_headers.len()
+            v2_headers.len()
         );
 
         // Add all header IDs to stored set (for tracking what we already have)
@@ -239,16 +335,11 @@ impl SyncProtocol {
         // Set our best headers for SyncInfo (exponentially spaced locator)
         *self.our_best_headers.write() = locator_ids;
 
-        // Add recent headers to header_chain for V2 SyncInfo
-        if !recent_headers.is_empty() {
-            let mut chain = self.header_chain.write();
-            for header in recent_headers {
-                chain.headers.push_back(header);
-            }
-            info!(
-                "Added {} headers to header_chain for V2 SyncInfo",
-                chain.headers.len()
-            );
+        // Store V2 sync headers (headers at offsets [0, 16, 128, 512] from best height)
+        if !v2_headers.is_empty() {
+            let heights: Vec<u32> = v2_headers.iter().map(|h| h.height).collect();
+            *self.v2_sync_headers.write() = v2_headers;
+            info!("Initialized V2 sync headers at heights: {:?}", heights);
         }
     }
 
@@ -296,6 +387,9 @@ impl SyncProtocol {
             SyncEvent::BlockFailed { block_id, error } => {
                 self.on_block_failed(&block_id, &error);
             }
+            SyncEvent::RequestBlocks { headers } => {
+                self.on_request_blocks(headers).await?;
+            }
             SyncEvent::Tick => {
                 self.on_tick().await?;
             }
@@ -339,20 +433,16 @@ impl SyncProtocol {
     }
 
     /// Build a V2 SyncInfo with serialized headers.
+    /// Uses headers at offsets [0, 16, 128, 512] from best height (matching Scala node).
     /// Falls back to V1 with genesis ID if we have no headers yet.
     fn build_v2_sync_info(&self) -> SyncInfo {
-        // Get headers from our chain (oldest first ordering in header_chain.headers)
-        let chain = self.header_chain.read();
+        // Use V2 sync headers (at offsets [0, 16, 128, 512] from best height)
+        let v2_headers = self.v2_sync_headers.read();
 
-        if !chain.headers.is_empty() {
-            // Get the last MAX_V2_HEADERS headers (most recent)
-            // header_chain.headers is in oldest-first order (push_back)
-            let headers: Vec<_> = chain.headers.iter().collect();
-            let start = headers.len().saturating_sub(MAX_V2_HEADERS);
-
+        if !v2_headers.is_empty() {
             // Serialize headers for V2 format
-            // V2 expects [oldest, ..., newest] order, which is already our order
-            let serialized_headers: Vec<Vec<u8>> = headers[start..]
+            // Headers are already in newest-first order (best header at index 0)
+            let serialized_headers: Vec<Vec<u8>> = v2_headers
                 .iter()
                 .filter_map(|h| {
                     match h.scorex_serialize_bytes() {
@@ -366,11 +456,11 @@ impl SyncProtocol {
                 .collect();
 
             if !serialized_headers.is_empty() {
-                info!(
+                let heights: Vec<u32> = v2_headers.iter().map(|h| h.height).collect();
+                debug!(
                     header_count = serialized_headers.len(),
-                    first_height = headers[start].height,
-                    last_height = headers.last().map(|h| h.height).unwrap_or(0),
-                    "Built V2 SyncInfo with serialized headers"
+                    heights = ?heights,
+                    "Built V2 SyncInfo with headers at offset heights"
                 );
                 return SyncInfo::v2(serialized_headers);
             }
@@ -379,7 +469,7 @@ impl SyncProtocol {
         // No headers yet - send V1 with genesis ID
         // The genesis block at height=0 has ID = 0000...0000
         let genesis_id = vec![0u8; 32];
-        info!("No headers to serialize - sending V1 SyncInfo with genesis ID");
+        debug!("No headers to serialize - sending V1 SyncInfo with genesis ID");
         SyncInfo::v1(vec![genesis_id])
     }
 
@@ -395,7 +485,7 @@ impl SyncProtocol {
         // Get header IDs and peer height from either V1 or V2 format
         let (header_ids, peer_height): (Vec<Vec<u8>>, Option<u32>) = if info.is_v2() {
             // V2 format contains full serialized headers - parse them to get height
-            info!(peer = %peer, headers = info.last_headers.len(), "Received SyncInfo V2");
+            debug!(peer = %peer, headers = info.last_headers.len(), "Received SyncInfo V2");
             let mut ids = Vec::new();
             let mut max_height: Option<u32> = None;
 
@@ -413,7 +503,7 @@ impl SyncProtocol {
             }
             (ids, max_height)
         } else {
-            info!(peer = %peer, header_ids = info.last_header_ids.len(), "Received SyncInfo V1");
+            debug!(peer = %peer, header_ids = info.last_header_ids.len(), "Received SyncInfo V1");
             // V1 format only has header IDs, no height info
             // We'll need to estimate or get it from other sources
             (info.last_header_ids.clone(), None)
@@ -531,20 +621,23 @@ impl SyncProtocol {
                 (filtered, removed)
             };
 
-            // Log removed IDs for debugging
+            // Log removed IDs for debugging (only at debug level to avoid spam)
             for removed_id in &removed_ids {
-                info!(
+                debug!(
                     removed_id = %hex::encode(removed_id),
                     "Filtered out header ID (already stored)"
                 );
             }
 
-            info!(
-                original = original_count,
-                filtered = filtered_ids.len(),
-                removed = removed_ids.len(),
-                "Filtered Inv IDs"
-            );
+            // Only log summary at info level if we actually filtered something
+            if removed_ids.len() > 0 {
+                debug!(
+                    original = original_count,
+                    filtered = filtered_ids.len(),
+                    removed = removed_ids.len(),
+                    "Filtered Inv IDs"
+                );
+            }
 
             let mut ids_iter = filtered_ids.into_iter();
 
@@ -660,20 +753,15 @@ impl SyncProtocol {
         // Remove from in-flight tracking
         self.in_flight_headers.write().remove(&id);
 
+        // Compute the correct header ID from the raw bytes.
+        // This is necessary because sigma-rust's Header::scorex_parse_bytes() computes
+        // the ID from reserialized bytes, which can differ from original bytes due to
+        // BigInt serialization issues in Autolykos v1 headers (leading 0xFF sign bytes).
+        let correct_id = compute_header_id(&data);
+
         // Parse header using sigma-rust
-        let header = match Header::scorex_parse_bytes(&data) {
-            Ok(h) => {
-                // Log all parsed headers for debugging
-                let actual_id = h.id.0.as_ref();
-                info!(
-                    height = h.height,
-                    msg_id = hex::encode(&id),
-                    actual_id = hex::encode(actual_id),
-                    id_match = (id == actual_id),
-                    "Parsed header"
-                );
-                h
-            }
+        let mut header = match Header::scorex_parse_bytes(&data) {
+            Ok(h) => h,
             Err(e) => {
                 warn!("Failed to parse header: {}", e);
                 return Err(SyncError::InvalidData(format!(
@@ -682,6 +770,26 @@ impl SyncProtocol {
                 )));
             }
         };
+
+        // Fix the header ID if it differs from the correct one
+        let sigma_id = header.id.0.as_ref().to_vec();
+        if sigma_id != correct_id {
+            debug!(
+                height = header.height,
+                sigma_id = hex::encode(&sigma_id),
+                correct_id = hex::encode(&correct_id),
+                "Fixing header ID (sigma-rust BigInt serialization issue)"
+            );
+            // Create a new BlockId with the correct hash
+            let correct_digest: [u8; 32] = correct_id.clone().try_into().expect("hash is 32 bytes");
+            header.id = BlockId(Digest32::from(correct_digest));
+        }
+
+        info!(
+            height = header.height,
+            id = hex::encode(&correct_id),
+            "Parsed header"
+        );
 
         // Note: We intentionally do NOT update peer_height from received headers.
         // With V1 SyncInfo, we don't know the peer's actual height - they could have
@@ -692,7 +800,8 @@ impl SyncProtocol {
         let parent_id = header.parent_id.0.as_ref().to_vec();
 
         // Check if we already have this header (in our in-memory tracking)
-        let already_stored = self.stored_headers.read().contains(&id);
+        // Use correct_id since that's what we store
+        let already_stored = self.stored_headers.read().contains(&correct_id);
         if already_stored {
             // Log at info level for first few headers to diagnose restart behavior
             if header.height <= 5 || header.height % 100 == 0 {
@@ -721,15 +830,17 @@ impl SyncProtocol {
         if parent_available {
             // Parent exists, we can store this header
             info!(height = header.height, "Storing header - parent available");
-            self.store_header_and_descendants(header).await?;
+            self.store_header_and_descendants(header, data).await?;
         } else {
             // Parent not available yet, buffer this header
+            // Use correct_id for pending tracking
             let pending_count = {
                 let mut pending = self.pending_headers.write();
                 pending.insert(
-                    id.clone(),
+                    correct_id.clone(),
                     PendingHeader {
                         header: header.clone(),
+                        raw_bytes: data,
                         parent_id: parent_id.clone(),
                     },
                 );
@@ -752,7 +863,11 @@ impl SyncProtocol {
     }
 
     /// Store a header and any pending descendants that can now be applied.
-    async fn store_header_and_descendants(&self, header: Header) -> SyncResult<()> {
+    async fn store_header_and_descendants(
+        &self,
+        header: Header,
+        raw_bytes: Vec<u8>,
+    ) -> SyncResult<()> {
         let header_id = header.id.0.as_ref().to_vec();
         let height = header.height;
 
@@ -761,9 +876,10 @@ impl SyncProtocol {
         // Create response channel for synchronous storage confirmation
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
-        // Send command to store the header
+        // Send command to store the header with raw bytes for correct ID preservation
         let cmd = SyncCommand::StoreHeader {
             header: header.clone(),
+            raw_bytes,
             response_tx,
         };
         self.command_tx
@@ -792,11 +908,39 @@ impl SyncProtocol {
         // Mark as stored (only after confirmation)
         self.stored_headers.write().insert(header_id.clone());
 
-        // Add to our header chain tracking
+        // Compute the BlockTransactions ID (derived from header ID + transactions root)
+        // This is NOT the same as the header ID!
+        // Formula: blake2b256(modifierTypeId ++ headerId ++ transactionsRoot)
+        let transactions_id = compute_block_section_id(
+            ModifierType::BlockTransactions.to_byte(),
+            &header_id,
+            header.transaction_root.0.as_ref(),
+        );
+
+        debug!(
+            height = header.height,
+            header_id = hex::encode(&header_id),
+            transactions_id = hex::encode(&transactions_id),
+            "Computed BlockTransactions ID for block download"
+        );
+
+        // Add to our header chain tracking (with memory limits enforced)
         {
             let mut chain = self.header_chain.write();
-            chain.headers.push_back(header);
-            chain.missing_blocks.push_back(header_id.clone());
+            chain.add_header(header.clone(), transactions_id, header_id.clone());
+        }
+
+        // Update V2 sync headers - the new header becomes the best (offset 0)
+        // This ensures our SyncInfo always includes our current best header
+        {
+            let mut v2_headers = self.v2_sync_headers.write();
+            if v2_headers.is_empty() {
+                // First header - just add it
+                v2_headers.push(header);
+            } else {
+                // Replace the best header (index 0) with the new one
+                v2_headers[0] = header;
+            }
         }
 
         // Update synchronizer height
@@ -838,7 +982,7 @@ impl SyncProtocol {
             let waiting: Vec<_> = pending
                 .iter()
                 .filter(|(_, ph)| ph.parent_id == parent_id)
-                .map(|(id, ph)| (id.clone(), ph.header.clone()))
+                .map(|(id, ph)| (id.clone(), ph.header.clone(), ph.raw_bytes.clone()))
                 .collect();
 
             if waiting.is_empty() && !pending.is_empty() {
@@ -868,12 +1012,12 @@ impl SyncProtocol {
         }
 
         // Apply each waiting header
-        for (id, header) in waiting {
+        for (id, header, raw_bytes) in waiting {
             // Remove from pending
             self.pending_headers.write().remove(&id);
 
             // Recursively store (this will check for its own descendants)
-            Box::pin(self.store_header_and_descendants(header)).await?;
+            Box::pin(self.store_header_and_descendants(header, raw_bytes)).await?;
         }
 
         Ok(())
@@ -915,13 +1059,20 @@ impl SyncProtocol {
             }
         };
 
+        // The `id` we received is the transactionsId (derived ID), not the header ID.
+        // We need to find the corresponding header. We can either:
+        // 1. Use the header_id from the parsed BlockTransactions
+        // 2. Look up our tx_id_to_header_id mapping
+        // Using the parsed header_id is more reliable since it comes from the data itself.
+        let header_id_from_block = block_txs.header_id.0.as_ref().to_vec();
+
         // Find the corresponding header for validation
         let header = {
             let chain = self.header_chain.read();
             chain
                 .headers
                 .iter()
-                .find(|h| h.id.0.as_ref() == id.as_slice())
+                .find(|h| h.id.0.as_ref() == header_id_from_block.as_slice())
                 .cloned()
         };
 
@@ -957,18 +1108,26 @@ impl SyncProtocol {
         }
 
         // Mark as downloaded
+        // Mark as downloaded using the transactionsId (which is what we requested)
         self.downloader.complete(&id);
         self.synchronizer.block_received(&id);
 
         // Send command to apply the block
+        // Use the header_id from the BlockTransactions, not the transactionsId
         let cmd = SyncCommand::ApplyBlock {
-            block_id: id,
+            block_id: header_id_from_block.clone(),
             block_data: data,
         };
         self.command_tx
             .send(cmd)
             .await
             .map_err(|e| SyncError::Internal(format!("Failed to send command: {}", e)))?;
+
+        // Clean up the tx_id_to_header_id mapping
+        {
+            let mut chain = self.header_chain.write();
+            chain.tx_id_to_header_id.remove(&id);
+        }
 
         Ok(())
     }
@@ -983,9 +1142,33 @@ impl SyncProtocol {
         // Update our height
         self.synchronizer.set_height(height);
 
-        // Remove from header chain
+        // Remove from header chain - note: block_id here is the header_id
+        // We need to find and remove the corresponding transactionsId from missing_blocks
         let mut chain = self.header_chain.write();
-        chain.missing_blocks.retain(|id| id != block_id);
+
+        // Find the transactionsId that corresponds to this header_id
+        let tx_id_to_remove: Option<Vec<u8>> = chain
+            .tx_id_to_header_id
+            .iter()
+            .find(|(_, hid)| hid.as_slice() == block_id)
+            .map(|(tid, _)| tid.clone());
+
+        if let Some(tx_id) = tx_id_to_remove {
+            chain.missing_blocks.retain(|id| id != &tx_id);
+            chain.tx_id_to_header_id.remove(&tx_id);
+        }
+
+        // Log memory stats periodically (every 1000 blocks)
+        if height % 1000 == 0 {
+            let (headers, pending, mappings) = chain.memory_stats();
+            info!(
+                height,
+                cached_headers = headers,
+                pending_blocks = pending,
+                id_mappings = mappings,
+                "Sync memory stats"
+            );
+        }
     }
 
     /// Handle failed block application.
@@ -996,6 +1179,68 @@ impl SyncProtocol {
         );
 
         // Could re-request from different peer or mark as invalid
+    }
+
+    /// Handle request to download blocks for specific headers.
+    /// The node sends this with headers for blocks it needs (starting from UTXO height + 1).
+    async fn on_request_blocks(&self, headers: Vec<Header>) -> SyncResult<()> {
+        if headers.is_empty() {
+            return Ok(());
+        }
+
+        // Collect download tasks, checking for duplicates
+        let mut tasks = Vec::new();
+        let stats = self.downloader.stats();
+
+        for header in &headers {
+            let header_id = header.id.0.as_ref().to_vec();
+            let transactions_id = compute_block_section_id(
+                ModifierType::BlockTransactions.to_byte(),
+                &header_id,
+                header.transaction_root.0.as_ref(),
+            );
+
+            // Add to our tracking so we can match received blocks to headers
+            // But only if not already tracked
+            {
+                let mut chain = self.header_chain.write();
+                if !chain.tx_id_to_header_id.contains_key(&transactions_id) {
+                    chain.headers.push_back(header.clone());
+                    chain
+                        .tx_id_to_header_id
+                        .insert(transactions_id.clone(), header_id);
+                    // Don't add to missing_blocks - we use the downloader's pending queue instead
+                }
+            }
+
+            // Queue download task
+            let task =
+                DownloadTask::new(transactions_id, ModifierType::BlockTransactions.to_byte());
+            tasks.push(task);
+        }
+
+        // Queue all tasks at once (the queue method will skip duplicates)
+        if !tasks.is_empty() {
+            self.downloader.queue(tasks);
+
+            // Log current state
+            let new_stats = self.downloader.stats();
+            info!(
+                requested = headers.len(),
+                first_height = headers.first().map(|h| h.height),
+                last_height = headers.last().map(|h| h.height),
+                pending = new_stats.pending,
+                in_flight = new_stats.in_flight,
+                was_pending = stats.pending,
+                was_in_flight = stats.in_flight,
+                "Queued block downloads"
+            );
+        }
+
+        // Dispatch the downloads immediately
+        self.dispatch_downloads().await?;
+
+        Ok(())
     }
 
     /// Periodic tick handler.
@@ -1074,6 +1319,8 @@ impl SyncProtocol {
                 sync_mode,
                 pending = stats.pending,
                 in_flight = stats.in_flight,
+                completed = stats.completed,
+                failed = stats.failed,
                 "Sync progress"
             );
         }
@@ -1279,11 +1526,6 @@ impl SyncProtocol {
 
     /// Dispatch pending downloads to peers.
     async fn dispatch_downloads(&self) -> SyncResult<()> {
-        let tasks = self.downloader.get_ready_tasks(16);
-        if tasks.is_empty() {
-            return Ok(());
-        }
-
         // Find a peer that can receive requests
         let peer = match self.find_peer_for_request() {
             Some(p) => p,
@@ -1292,6 +1534,27 @@ impl SyncProtocol {
                 return Ok(());
             }
         };
+
+        // Get tasks that can be dispatched to THIS peer (excluding blocks they failed to deliver)
+        // Use larger batch size (50) for better throughput
+        let tasks = self.downloader.get_ready_tasks_for_peer(50, &peer);
+        if tasks.is_empty() {
+            // Check if there are stuck tasks (failed with all peers)
+            let all_peers: Vec<_> = self.sync_peers.read().keys().cloned().collect();
+            let stuck = self.downloader.get_stuck_tasks(&all_peers);
+            if !stuck.is_empty() {
+                warn!(
+                    stuck_count = stuck.len(),
+                    peer_count = all_peers.len(),
+                    "Some blocks stuck - all peers failed to deliver them"
+                );
+                // Clear the failed_peers for stuck tasks so they can be retried
+                for id in &stuck {
+                    self.downloader.clear_failed_peers(id);
+                }
+            }
+            return Ok(());
+        }
 
         // Group tasks by type and batch them
         let mut by_type: std::collections::HashMap<u8, Vec<Vec<u8>>> =
@@ -1312,6 +1575,12 @@ impl SyncProtocol {
 
         // Send one batched request per type
         for (type_id, ids) in by_type {
+            debug!(
+                peer = %peer,
+                type_id,
+                count = ids.len(),
+                "Dispatching block download request"
+            );
             let request = ModifierRequest { type_id, ids };
             self.send_to_peer(&peer, Message::RequestModifier(request))
                 .await?;
@@ -1347,5 +1616,56 @@ mod tests {
         let protocol = SyncProtocol::new(SyncConfig::default(), tx);
 
         assert!(!protocol.synchronizer().is_synced());
+    }
+
+    #[test]
+    fn test_compute_block_section_id() {
+        // Test that compute_block_section_id produces correct derived IDs
+        // Formula: blake2b256(typeId ++ headerId ++ sectionDigest)
+
+        let type_id = ModifierType::BlockTransactions.to_byte(); // 102
+        let header_id = vec![0x01; 32]; // dummy header ID
+        let transactions_root = vec![0x02; 32]; // dummy transactions root
+
+        let result = compute_block_section_id(type_id, &header_id, &transactions_root);
+
+        // Verify the result is 32 bytes (blake2b-256 output)
+        assert_eq!(result.len(), 32);
+
+        // Verify it's different from both inputs (it's a hash)
+        assert_ne!(result, header_id);
+        assert_ne!(result, transactions_root);
+
+        // Verify determinism - same inputs produce same output
+        let result2 = compute_block_section_id(type_id, &header_id, &transactions_root);
+        assert_eq!(result, result2);
+
+        // Verify different type_id produces different result
+        let result_different_type = compute_block_section_id(
+            ModifierType::Extension.to_byte(),
+            &header_id,
+            &transactions_root,
+        );
+        assert_ne!(result, result_different_type);
+    }
+
+    #[test]
+    fn test_compute_header_id() {
+        // Test that compute_header_id produces blake2b-256 hash
+        let data = vec![0x01, 0x02, 0x03, 0x04];
+
+        let result = compute_header_id(&data);
+
+        // Verify the result is 32 bytes
+        assert_eq!(result.len(), 32);
+
+        // Verify determinism
+        let result2 = compute_header_id(&data);
+        assert_eq!(result, result2);
+
+        // Verify different data produces different hash
+        let data2 = vec![0x01, 0x02, 0x03, 0x05];
+        let result3 = compute_header_id(&data2);
+        assert_ne!(result, result3);
     }
 }

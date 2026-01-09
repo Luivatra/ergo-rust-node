@@ -282,10 +282,11 @@ impl Node {
             NetworkService::new(network_config, Arc::clone(&self.peers));
 
         // Create sync protocol
-        let (sync_cmd_tx, mut sync_cmd_rx) = mpsc::channel::<SyncCommand>(100);
+        let (sync_cmd_tx, mut sync_cmd_rx) = mpsc::channel::<SyncCommand>(500);
         // Large buffer for sync events to avoid blocking during header sync
-        // Headers come in batches of 400, so we need enough capacity
-        let (sync_event_tx, mut sync_event_rx) = mpsc::channel::<SyncEvent>(1000);
+        // Headers come in batches of 400 from multiple peers, and disk I/O can be slow
+        // Need enough capacity to buffer while headers are being written to storage
+        let (sync_event_tx, mut sync_event_rx) = mpsc::channel::<SyncEvent>(10000);
         let sync_protocol = SyncProtocol::new(SyncConfig::default(), sync_cmd_tx.clone());
 
         // Initialize sync protocol with stored headers from database
@@ -318,26 +319,30 @@ impl Node {
                         }
                     };
 
-                    // Get the most recent headers for V2 SyncInfo (last 10)
-                    let recent_headers: Vec<_> = headers
+                    // Get headers at V2 SyncInfo offsets: [0, 16, 128, 512] from best height
+                    // These are sent in newest-first order (offset 0 = best header first)
+                    // The Scala node uses these specific offsets for commonPoint detection
+                    const V2_SYNC_OFFSETS: [u32; 4] = [0, 16, 128, 512];
+                    let v2_headers: Vec<_> = V2_SYNC_OFFSETS
                         .iter()
-                        .rev()
-                        .take(10)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev() // Restore oldest-first order
+                        .filter_map(|offset| {
+                            let target_height = header_height.saturating_sub(*offset);
+                            if target_height > 0 {
+                                // Find header at this height in our loaded headers
+                                headers.iter().find(|h| h.height == target_height).cloned()
+                            } else {
+                                None
+                            }
+                        })
                         .collect();
                     info!(
-                        "Got {} recent headers for V2 SyncInfo",
-                        recent_headers.len()
+                        "Got {} headers for V2 SyncInfo at offsets {:?}, heights: {:?}",
+                        v2_headers.len(),
+                        V2_SYNC_OFFSETS,
+                        v2_headers.iter().map(|h| h.height).collect::<Vec<_>>()
                     );
 
-                    sync_protocol.init_from_stored_headers(
-                        all_header_ids,
-                        locator_ids,
-                        recent_headers,
-                    );
+                    sync_protocol.init_from_stored_headers(all_header_ids, locator_ids, v2_headers);
                 }
                 Ok(_) => {
                     warn!(
@@ -404,8 +409,12 @@ impl Node {
             std::collections::HashSet::new();
         // Desired minimum number of connections
         let min_connections: usize = 3;
-        // Maximum number of connections to maintain
-        let max_connections: usize = 10;
+        // Maximum number of connections to maintain (increased from 10 for faster sync)
+        let max_connections: usize = 25;
+
+        // Buffer for blocks received out of order, indexed by height
+        let mut pending_blocks: std::collections::BTreeMap<u32, (Vec<u8>, Vec<u8>)> =
+            std::collections::BTreeMap::new();
 
         tokio::spawn(async move {
             // Tick interval for sync protocol housekeeping (every 1 second)
@@ -417,12 +426,46 @@ impl Node {
             let mut reconnect_interval = tokio::time::interval(std::time::Duration::from_secs(10));
             reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+            // Block sync check interval (every 5 seconds)
+            let mut block_sync_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            block_sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             while !shutdown_for_router.load(Ordering::SeqCst) {
                 tokio::select! {
                     // Periodic tick for sync protocol
                     _ = tick_interval.tick() => {
                         // Use try_send to avoid blocking if channel is full
                         let _ = sync_event_tx_clone.try_send(SyncEvent::Tick);
+                    }
+                    // Periodic block sync check - triggers block downloads when headers are ahead
+                    _ = block_sync_interval.tick() => {
+                        let (utxo_height, header_height) = state_for_router.heights();
+                        // Only trigger if we have headers ahead of our UTXO state
+                        // and there's a meaningful gap (at least 1 block behind)
+                        if header_height > utxo_height && header_height > 0 {
+                            // Request next batch of blocks starting from current UTXO height + 1
+                            let batch_size = 16.min(header_height - utxo_height) as u32;
+                            match state_for_router.get_headers(utxo_height + 1, batch_size) {
+                                Ok(headers) if !headers.is_empty() => {
+                                    info!(
+                                        utxo_height,
+                                        header_height,
+                                        batch_size = headers.len(),
+                                        first_block = headers.first().map(|h| h.height),
+                                        "Triggering block download for missing blocks"
+                                    );
+                                    let _ = sync_event_tx_clone.send(SyncEvent::RequestBlocks {
+                                        headers,
+                                    }).await;
+                                }
+                                Ok(_) => {
+                                    debug!(utxo_height, header_height, "No headers found for block download");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to get headers for block sync check");
+                                }
+                            }
+                        }
                     }
                     // Periodic reconnection attempts
                     _ = reconnect_interval.tick() => {
@@ -580,9 +623,9 @@ impl Node {
                                     message,
                                 }).await;
                             }
-                            SyncCommand::StoreHeader { header, response_tx } => {
+                            SyncCommand::StoreHeader { header, raw_bytes, response_tx } => {
                                 let height = header.height;
-                                let result = match state_for_router.apply_header(header) {
+                                let result = match state_for_router.apply_header_with_bytes(header, &raw_bytes) {
                                     Ok(_) => {
                                         debug!(height, "Header stored in state");
                                         Ok(())
@@ -595,18 +638,9 @@ impl Node {
                                 let _ = response_tx.send(result);
                             }
                             SyncCommand::ApplyBlock { block_id, block_data } => {
-                                debug!(block_id = %hex::encode(&block_id), size = block_data.len(), "Applying block");
+                                debug!(block_id = %hex::encode(&block_id), size = block_data.len(), "Received block for application");
 
-                                // Parse BlockTransactions from raw data
-                                let block_txs = match BlockTransactions::parse(&block_data) {
-                                    Ok(txs) => txs,
-                                    Err(e) => {
-                                        warn!(block_id = %hex::encode(&block_id), error = ?e, "Failed to parse BlockTransactions");
-                                        continue;
-                                    }
-                                };
-
-                                // Get the header from state manager
+                                // Get the header to determine block height
                                 let header_id = BlockId(
                                     Digest32::from(
                                         <[u8; 32]>::try_from(block_id.as_slice()).unwrap_or([0u8; 32])
@@ -625,125 +659,292 @@ impl Node {
                                     }
                                 };
 
-                                let height = header.height;
+                                let block_height = header.height;
+                                let (current_utxo_height, _) = state_for_router.heights();
 
-                                // Get parent header for validation
-                                let parent_header = if height > 1 {
-                                    match state_for_router.get_header(&header.parent_id) {
-                                        Ok(Some(h)) => h,
-                                        Ok(None) => {
-                                            warn!(height, "Parent header not found");
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            warn!(height, error = %e, "Failed to get parent header");
-                                            continue;
-                                        }
-                                    }
-                                } else {
-                                    // For genesis block (height 1), use a minimal parent header
-                                    genesis_parent_header()
-                                };
-
-                                // Create FullBlock (with empty extension for now)
-                                let extension = Extension::empty(header_id.clone());
-                                let full_block = FullBlock::new(header.clone(), block_txs, extension, None);
-
-                                // Get last 10 headers for ErgoScript context
-                                let last_headers: [Header; 10] = {
-                                    let mut headers = Vec::with_capacity(10);
-                                    let start_height = if height > 10 { height - 10 } else { 1 };
-                                    for h in start_height..height {
-                                        if let Ok(Some(hdr)) = state_for_router.history.headers.get_by_height(h) {
-                                            headers.push(hdr);
-                                        }
-                                    }
-                                    // Pad with genesis parent if not enough headers
-                                    while headers.len() < 10 {
-                                        headers.insert(0, genesis_parent_header());
-                                    }
-                                    headers.try_into().unwrap_or_else(|_| std::array::from_fn(|_| genesis_parent_header()))
-                                };
-
-                                // Create block validator and validate
-                                let validator = FullBlockValidator::new();
-                                let utxo_state = &state_for_router.utxo;
-
-                                // Create UTXO lookup closure that returns ErgoBox from BoxEntry
-                                let utxo_lookup = |box_id: &[u8]| -> Option<ErgoBox> {
-                                    utxo_state.get_box_by_bytes(box_id).ok().flatten().map(|entry| entry.ergo_box)
-                                };
-
-                                let validation_result = validator.validate_block(
-                                    &full_block,
-                                    &parent_header,
-                                    utxo_lookup,
-                                    last_headers,
-                                );
-
-                                if !validation_result.valid {
-                                    warn!(
-                                        height,
-                                        block_id = %hex::encode(&block_id),
-                                        error = ?validation_result.error,
-                                        "Block validation failed"
+                                // Check if this is the next block we need
+                                if block_height == current_utxo_height + 1 {
+                                    // This is the next block - apply it directly
+                                    debug!(height = block_height, "Block is next in sequence, applying directly");
+                                } else if block_height > current_utxo_height + 1 {
+                                    // Block arrived out of order - buffer it
+                                    debug!(
+                                        block_height,
+                                        current_utxo_height,
+                                        buffered = pending_blocks.len(),
+                                        "Block arrived out of order, buffering"
                                     );
-                                    let _ = sync_event_tx_clone.send(SyncEvent::BlockFailed {
-                                        block_id,
-                                        error: validation_result.error.unwrap_or_else(|| "Unknown validation error".to_string()),
-                                    }).await;
+                                    pending_blocks.insert(block_height, (block_id.clone(), block_data.clone()));
+                                    continue;
+                                } else {
+                                    // Block is at or below current height - already applied or stale
+                                    debug!(block_height, current_utxo_height, "Block already applied or stale, skipping");
                                     continue;
                                 }
 
-                                // Extract validated state change
-                                let validated_change = validation_result.state_change.expect("Valid block must have state change");
+                                // Collect blocks to process: current one + any buffered sequential blocks
+                                let mut blocks_to_process = vec![(block_id.clone(), block_data.clone())];
 
-                                // Convert ValidatedStateChange to StateChange
-                                // spent needs BoxId, created needs BoxEntry
-                                let state_change = StateChange {
-                                    spent: validated_change.spent.iter().filter_map(|s| {
-                                        if s.box_id.len() == 32 {
-                                            let mut arr = [0u8; 32];
-                                            arr.copy_from_slice(&s.box_id);
-                                            Some(BoxId::from(Digest32::from(arr)))
-                                        } else {
-                                            None
+                                // Collect buffered blocks that form a contiguous sequence
+                                let (current_utxo, _) = state_for_router.heights();
+                                let mut next_height = current_utxo + 2; // +1 is the current block, +2 is next
+                                while let Some((next_bid, next_bdata)) = pending_blocks.remove(&next_height) {
+                                    blocks_to_process.push((next_bid, next_bdata));
+                                    next_height += 1;
+                                }
+
+                                // Batch size for writing to disk (tune for performance)
+                                const BATCH_WRITE_SIZE: usize = 32;
+
+                                // Validate blocks and collect them for batched application
+                                let mut validated_blocks: Vec<(ergo_consensus::FullBlock, StateChange, Vec<u8>)> = Vec::new();
+                                let mut validation_failed = false;
+
+                                for (bid, bdata) in blocks_to_process {
+                                    if validation_failed {
+                                        // Re-buffer blocks after a failure
+                                        let hdr_id = BlockId(Digest32::from(<[u8; 32]>::try_from(bid.as_slice()).unwrap_or([0u8; 32])));
+                                        if let Ok(Some(hdr)) = state_for_router.get_header(&hdr_id) {
+                                            pending_blocks.insert(hdr.height, (bid, bdata));
                                         }
-                                    }).collect(),
-                                    created: validated_change.created.iter().map(|c| {
-                                        BoxEntry::new(
-                                            c.ergo_box.clone(),
-                                            height,
-                                            c.tx_id.clone(),
-                                            c.output_index,
-                                        )
-                                    }).collect(),
-                                };
-
-                                info!(
-                                    height,
-                                    total_cost = validation_result.total_cost,
-                                    spent = state_change.spent.len(),
-                                    created = state_change.created.len(),
-                                    "Block validated, applying to UTXO state"
-                                );
-
-                                // Apply block to state
-                                match state_for_router.apply_block(full_block, state_change) {
-                                    Ok(_) => {
-                                        info!(height, block_id = %hex::encode(&block_id), "Block applied successfully");
-                                        // Notify sync protocol
-                                        let _ = sync_event_tx_clone.send(SyncEvent::BlockApplied {
-                                            block_id,
-                                            height,
-                                        }).await;
+                                        continue;
                                     }
-                                    Err(e) => {
-                                        warn!(height, block_id = %hex::encode(&block_id), error = %e, "Failed to apply block");
+
+                                    // Parse BlockTransactions from raw data
+                                    let block_txs = match BlockTransactions::parse(&bdata) {
+                                        Ok(txs) => txs,
+                                        Err(e) => {
+                                            warn!(block_id = %hex::encode(&bid), error = ?e, "Failed to parse BlockTransactions");
+                                            let _ = sync_event_tx_clone.send(SyncEvent::BlockFailed {
+                                                block_id: bid,
+                                                error: format!("Parse error: {:?}", e),
+                                            }).await;
+                                            validation_failed = true;
+                                            continue;
+                                        }
+                                    };
+
+                                    // Get the header from state manager
+                                    let hdr_id = BlockId(
+                                        Digest32::from(
+                                            <[u8; 32]>::try_from(bid.as_slice()).unwrap_or([0u8; 32])
+                                        )
+                                    );
+
+                                    let hdr = match state_for_router.get_header(&hdr_id) {
+                                        Ok(Some(h)) => h,
+                                        Ok(None) => {
+                                            warn!(block_id = %hex::encode(&bid), "Header not found for block");
+                                            validation_failed = true;
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            warn!(block_id = %hex::encode(&bid), error = %e, "Failed to get header");
+                                            validation_failed = true;
+                                            continue;
+                                        }
+                                    };
+
+                                    let height = hdr.height;
+
+                                    // Get parent header for validation
+                                    let parent_header = if height > 1 {
+                                        match state_for_router.get_header(&hdr.parent_id) {
+                                            Ok(Some(h)) => h,
+                                            Ok(None) => {
+                                                warn!(height, "Parent header not found");
+                                                validation_failed = true;
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                warn!(height, error = %e, "Failed to get parent header");
+                                                validation_failed = true;
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        genesis_parent_header()
+                                    };
+
+                                    // Create FullBlock
+                                    let extension = Extension::empty(hdr_id.clone());
+                                    let full_block = FullBlock::new(hdr.clone(), block_txs, extension, None);
+
+                                    // Get last 10 headers for ErgoScript context
+                                    let last_headers: [Header; 10] = {
+                                        let mut headers = Vec::with_capacity(10);
+                                        let start_height = if height > 10 { height - 10 } else { 1 };
+                                        for h in start_height..height {
+                                            if let Ok(Some(hdr)) = state_for_router.history.headers.get_by_height(h) {
+                                                headers.push(hdr);
+                                            }
+                                        }
+                                        while headers.len() < 10 {
+                                            headers.insert(0, genesis_parent_header());
+                                        }
+                                        headers.try_into().unwrap_or_else(|_| std::array::from_fn(|_| genesis_parent_header()))
+                                    };
+
+                                    // Validate block
+                                    let validator = FullBlockValidator::new();
+                                    let utxo_state = &state_for_router.utxo;
+                                    let utxo_lookup = |box_id: &[u8]| -> Option<ErgoBox> {
+                                        utxo_state.get_box_by_bytes(box_id).ok().flatten().map(|entry| entry.ergo_box)
+                                    };
+
+                                    let validation_result = validator.validate_block(
+                                        &full_block,
+                                        &parent_header,
+                                        utxo_lookup,
+                                        last_headers,
+                                    );
+
+                                    if !validation_result.valid {
+                                        warn!(
+                                            height,
+                                            block_id = %hex::encode(&bid),
+                                            error = ?validation_result.error,
+                                            "Block validation failed"
+                                        );
                                         let _ = sync_event_tx_clone.send(SyncEvent::BlockFailed {
-                                            block_id,
-                                            error: e.to_string(),
+                                            block_id: bid,
+                                            error: validation_result.error.unwrap_or_else(|| "Unknown validation error".to_string()),
                                         }).await;
+                                        validation_failed = true;
+                                        continue;
+                                    }
+
+                                    // Convert validated state change
+                                    let validated_change = validation_result.state_change.expect("Valid block must have state change");
+                                    let state_change = StateChange {
+                                        spent: validated_change.spent.iter().filter_map(|s| {
+                                            if s.box_id.len() == 32 {
+                                                let mut arr = [0u8; 32];
+                                                arr.copy_from_slice(&s.box_id);
+                                                Some(BoxId::from(Digest32::from(arr)))
+                                            } else {
+                                                None
+                                            }
+                                        }).collect(),
+                                        created: validated_change.created.iter().map(|c| {
+                                            BoxEntry::new(
+                                                c.ergo_box.clone(),
+                                                height,
+                                                c.tx_id.clone(),
+                                                c.output_index,
+                                            )
+                                        }).collect(),
+                                    };
+
+                                    debug!(
+                                        height,
+                                        total_cost = validation_result.total_cost,
+                                        spent = state_change.spent.len(),
+                                        created = state_change.created.len(),
+                                        "Block validated"
+                                    );
+
+                                    validated_blocks.push((full_block, state_change, bid));
+
+                                    // Apply batch if we've reached the batch size
+                                    if validated_blocks.len() >= BATCH_WRITE_SIZE {
+                                        let batch_count = validated_blocks.len();
+                                        let first_h = validated_blocks[0].0.height();
+                                        let last_h = validated_blocks[batch_count - 1].0.height();
+
+                                        // Convert to the format expected by apply_blocks_batched
+                                        let blocks_for_batch: Vec<_> = validated_blocks
+                                            .drain(..)
+                                            .map(|(fb, sc, bid)| ((fb, sc), bid))
+                                            .collect();
+
+                                        let block_ids: Vec<_> = blocks_for_batch.iter().map(|(_, bid)| bid.clone()).collect();
+                                        let blocks: Vec<_> = blocks_for_batch.into_iter().map(|((fb, sc), _)| (fb, sc)).collect();
+
+                                        match state_for_router.apply_blocks_batched(blocks) {
+                                            Ok(_) => {
+                                                info!(first_h, last_h, batch_count, "Batch of blocks applied successfully");
+                                                // Notify sync protocol for each block
+                                                for (i, bid) in block_ids.into_iter().enumerate() {
+                                                    let h = first_h + i as u32;
+                                                    let _ = sync_event_tx_clone.send(SyncEvent::BlockApplied {
+                                                        block_id: bid,
+                                                        height: h,
+                                                    }).await;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(first_h, last_h, error = %e, "Failed to apply block batch");
+                                                for bid in block_ids {
+                                                    let _ = sync_event_tx_clone.send(SyncEvent::BlockFailed {
+                                                        block_id: bid,
+                                                        error: e.to_string(),
+                                                    }).await;
+                                                }
+                                                validation_failed = true;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Apply remaining validated blocks
+                                if !validated_blocks.is_empty() && !validation_failed {
+                                    let batch_count = validated_blocks.len();
+                                    let first_h = validated_blocks[0].0.height();
+                                    let last_h = validated_blocks[batch_count - 1].0.height();
+
+                                    let blocks_for_batch: Vec<_> = validated_blocks
+                                        .drain(..)
+                                        .map(|(fb, sc, bid)| ((fb, sc), bid))
+                                        .collect();
+
+                                    let block_ids: Vec<_> = blocks_for_batch.iter().map(|(_, bid)| bid.clone()).collect();
+                                    let blocks: Vec<_> = blocks_for_batch.into_iter().map(|((fb, sc), _)| (fb, sc)).collect();
+
+                                    match state_for_router.apply_blocks_batched(blocks) {
+                                        Ok(_) => {
+                                            info!(first_h, last_h, batch_count, "Final batch of blocks applied successfully");
+                                            for (i, bid) in block_ids.into_iter().enumerate() {
+                                                let h = first_h + i as u32;
+                                                let _ = sync_event_tx_clone.send(SyncEvent::BlockApplied {
+                                                    block_id: bid,
+                                                    height: h,
+                                                }).await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(first_h, last_h, error = %e, "Failed to apply final block batch");
+                                            for bid in block_ids {
+                                                let _ = sync_event_tx_clone.send(SyncEvent::BlockFailed {
+                                                    block_id: bid,
+                                                    error: e.to_string(),
+                                                }).await;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // After processing, request more blocks if we're still behind
+                                let (utxo_height, header_height) = state_for_router.heights();
+                                if utxo_height < header_height {
+                                    // Get next batch of headers to download blocks for
+                                    let batch_size = 16.min(header_height - utxo_height) as u32;
+                                    match state_for_router.get_headers(utxo_height + 1, batch_size) {
+                                        Ok(headers) if !headers.is_empty() => {
+                                            debug!(
+                                                utxo_height,
+                                                header_height,
+                                                batch_size = headers.len(),
+                                                "Requesting next batch of blocks"
+                                            );
+                                            let _ = sync_event_tx_clone.send(SyncEvent::RequestBlocks {
+                                                headers,
+                                            }).await;
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            warn!(error = %e, "Failed to get headers for block download");
+                                        }
                                     }
                                 }
                             }

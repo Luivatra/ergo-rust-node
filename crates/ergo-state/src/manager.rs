@@ -86,8 +86,17 @@ impl StateManager {
     }
 
     /// Check if state is synchronized.
+    /// We consider ourselves synced if:
+    /// 1. We have headers (header height > 0)
+    /// 2. Our full block height matches our header height (all blocks downloaded)
+    /// 3. We have at least some blocks (full block height > 0)
+    /// During initial header sync (no blocks yet), we report as NOT synced.
     pub fn is_synced(&self) -> bool {
-        self.utxo.height() == self.history.best_full_block_height()
+        let header_height = self.history.best_height();
+        let full_block_height = self.history.best_full_block_height();
+
+        // Must have blocks and headers must match full blocks
+        full_block_height > 0 && full_block_height == header_height
     }
 
     /// Get the gap between headers and full blocks.
@@ -99,6 +108,17 @@ impl StateManager {
     #[instrument(skip(self, header), fields(height = header.height))]
     pub fn apply_header(&self, header: Header) -> StateResult<crate::ChainSelection> {
         self.history.append_header(header)
+    }
+
+    /// Apply a validated header to the chain using raw bytes.
+    /// This preserves correct ID computation for headers with BigInt serialization issues.
+    #[instrument(skip(self, header, raw_bytes), fields(height = header.height))]
+    pub fn apply_header_with_bytes(
+        &self,
+        header: Header,
+        raw_bytes: &[u8],
+    ) -> StateResult<crate::ChainSelection> {
+        self.history.append_header_with_bytes(header, raw_bytes)
     }
 
     /// Apply a validated full block to the state.
@@ -192,6 +212,134 @@ impl StateManager {
     /// Apply state change without storing block (for validation).
     pub fn apply_state_change(&self, state_change: &StateChange, height: u32) -> StateResult<()> {
         self.utxo.apply_change(state_change, height)
+    }
+
+    /// Apply multiple blocks in a single batched write operation.
+    /// This is significantly more efficient than applying blocks individually during sync.
+    ///
+    /// Each element is a tuple of (FullBlock, StateChange).
+    /// Blocks must be in ascending height order and contiguous.
+    #[instrument(skip(self, blocks), fields(count = blocks.len()))]
+    pub fn apply_blocks_batched(
+        &self,
+        blocks: Vec<(FullBlock, StateChange)>,
+    ) -> StateResult<crate::ChainSelection> {
+        if blocks.is_empty() {
+            return Ok(crate::ChainSelection::Ignored);
+        }
+
+        let first_height = blocks[0].0.height();
+        let last_height = blocks[blocks.len() - 1].0.height();
+        let count = blocks.len();
+
+        // Verify this batch extends current state
+        let utxo_height = self.utxo.height();
+        if first_height != utxo_height + 1 {
+            return Err(StateError::InvalidTransition(format!(
+                "Expected first block at height {}, got {}",
+                utxo_height + 1,
+                first_height
+            )));
+        }
+
+        // Verify blocks are contiguous
+        for (i, (block, _)) in blocks.iter().enumerate() {
+            let expected_height = first_height + i as u32;
+            if block.height() != expected_height {
+                return Err(StateError::InvalidTransition(format!(
+                    "Non-contiguous block: expected height {}, got {}",
+                    expected_height,
+                    block.height()
+                )));
+            }
+        }
+
+        info!(
+            first_height,
+            last_height, count, "Applying {} blocks in batched write", count
+        );
+
+        // Create a single batch for ALL blocks
+        let mut batch = ergo_storage::WriteBatch::new();
+
+        // Get starting cumulative difficulty
+        let mut cumulative_difficulty = if first_height <= 2 {
+            num_bigint::BigUint::from(0u32)
+        } else {
+            let parent_id = &blocks[0].0.header.parent_id;
+            self.history
+                .get_cumulative_difficulty(parent_id)?
+                .unwrap_or_else(|| num_bigint::BigUint::from(0u32))
+        };
+
+        // Add all blocks to the batch
+        let mut final_block_id = blocks[0].0.id();
+        for (block, state_change) in &blocks {
+            let height = block.height();
+            final_block_id = block.id();
+
+            // Add block data to history batch
+            cumulative_difficulty =
+                self.history
+                    .add_block_to_batch(&mut batch, block, &cumulative_difficulty)?;
+
+            // Add UTXO changes to batch
+            self.utxo
+                .add_change_to_batch(&mut batch, state_change, height)?;
+        }
+
+        // Add final metadata updates
+        let current_best_difficulty = self.history.best_cumulative_difficulty();
+        let selection = if cumulative_difficulty > current_best_difficulty {
+            batch.put(
+                ergo_storage::ColumnFamily::Metadata,
+                b"best_header_id",
+                final_block_id.0.as_ref().to_vec(),
+            );
+            batch.put(
+                ergo_storage::ColumnFamily::Metadata,
+                b"best_height",
+                last_height.to_be_bytes().to_vec(),
+            );
+            batch.put(
+                ergo_storage::ColumnFamily::Metadata,
+                b"best_cumulative_difficulty",
+                cumulative_difficulty.to_bytes_be(),
+            );
+            crate::ChainSelection::Extended
+        } else {
+            crate::ChainSelection::Ignored
+        };
+
+        // Update best full block metadata
+        let current_full_height = self.history.best_full_block_height();
+        if last_height > current_full_height {
+            batch.put(
+                ergo_storage::ColumnFamily::Metadata,
+                b"best_full_block_id",
+                final_block_id.0.as_ref().to_vec(),
+            );
+            batch.put(
+                ergo_storage::ColumnFamily::Metadata,
+                b"best_full_block_height",
+                last_height.to_be_bytes().to_vec(),
+            );
+        }
+
+        // Execute single batch write for ALL blocks
+        self.history.execute_batch(batch)?;
+
+        // Update in-memory state after successful write
+        self.history
+            .update_in_memory_state(final_block_id, last_height, cumulative_difficulty);
+        self.utxo.update_height_in_memory(last_height);
+
+        info!(
+            first_height,
+            last_height, count, "Successfully applied {} blocks in single batch", count
+        );
+
+        Ok(selection)
     }
 
     /// Rollback state to a previous height.

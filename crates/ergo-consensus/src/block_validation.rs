@@ -65,12 +65,35 @@ pub struct CreatedBox {
     pub output_index: u16,
 }
 
+/// Checkpoint configuration for fast initial sync.
+/// Below the checkpoint height, script verification is skipped.
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    /// Height up to which to skip full validation.
+    pub height: u32,
+    /// Block ID at checkpoint height (for verification).
+    pub block_id: String,
+}
+
+impl Checkpoint {
+    /// Mainnet checkpoint (from Scala node config).
+    pub fn mainnet() -> Self {
+        Self {
+            height: 1231454,
+            block_id: "ca5aa96a2d560f49cd5652eae4b9e16bbf410ee32032365313dc16544ee5fda1e6d"
+                .to_string(),
+        }
+    }
+}
+
 /// Full block validator with ErgoScript execution.
 pub struct FullBlockValidator {
     /// Maximum block cost allowed.
     max_block_cost: u64,
     /// Whether to skip script verification (for testing only).
     skip_script_verification: bool,
+    /// Optional checkpoint for fast initial sync.
+    checkpoint: Option<Checkpoint>,
 }
 
 impl Default for FullBlockValidator {
@@ -81,10 +104,21 @@ impl Default for FullBlockValidator {
 
 impl FullBlockValidator {
     /// Create a new block validator with default settings.
+    /// Uses mainnet checkpoint for fast initial sync.
     pub fn new() -> Self {
         Self {
             max_block_cost: MAX_BLOCK_COST,
             skip_script_verification: false,
+            checkpoint: Some(Checkpoint::mainnet()),
+        }
+    }
+
+    /// Create a block validator without checkpoint (full validation from genesis).
+    pub fn without_checkpoint() -> Self {
+        Self {
+            max_block_cost: MAX_BLOCK_COST,
+            skip_script_verification: false,
+            checkpoint: None,
         }
     }
 
@@ -94,7 +128,15 @@ impl FullBlockValidator {
         Self {
             max_block_cost: MAX_BLOCK_COST,
             skip_script_verification: true,
+            checkpoint: None,
         }
+    }
+
+    /// Check if a block is below the checkpoint height.
+    fn is_below_checkpoint(&self, height: u32) -> bool {
+        self.checkpoint
+            .as_ref()
+            .map_or(false, |cp| height <= cp.height)
     }
 
     /// Validate a full block against the current UTXO state.
@@ -216,8 +258,12 @@ impl FullBlockValidator {
             )));
         }
 
-        // Version must be valid (1, 2, or 3)
-        if header.version < 1 || header.version > 3 {
+        // Version must be valid (1, 2, 3, or 4)
+        // Version 1: Initial mainnet version
+        // Version 2: Hardening hard-fork (Autolykos v2, witnesses in tx Merkle tree)
+        // Version 3: 5.0 soft-fork (JITC, EIP-39)
+        // Version 4: 6.0 soft-fork (EIP-50)
+        if header.version < 1 || header.version > 4 {
             return Err(ConsensusError::InvalidHeader(format!(
                 "Invalid version: {}",
                 header.version
@@ -251,8 +297,22 @@ impl FullBlockValidator {
         // Track boxes created in this block (can be spent within same block)
         let mut created_in_block: HashMap<Vec<u8>, ErgoBox> = HashMap::new();
 
-        // Create verifier for script execution
-        let verifier = TxVerifier::new(height, pre_header.clone(), last_headers.clone());
+        // Check if we're in checkpoint mode (fast initial sync)
+        let checkpoint_mode = self.is_below_checkpoint(height);
+        if checkpoint_mode && height % 10000 == 0 {
+            info!(height, "Checkpoint mode: skipping full validation");
+        }
+
+        // Create verifier for script execution (only needed outside checkpoint mode)
+        let verifier = if !checkpoint_mode {
+            Some(TxVerifier::new(
+                height,
+                pre_header.clone(),
+                last_headers.clone(),
+            ))
+        } else {
+            None
+        };
 
         for (tx_idx, tx) in block_txs.iter().enumerate() {
             let is_coinbase = tx_idx == 0;
@@ -287,73 +347,97 @@ impl FullBlockValidator {
                 }
             }
 
-            // 3. Collect input boxes (from UTXO state or created earlier in this block)
-            let input_boxes: Vec<ErgoBox> =
-                self.collect_input_boxes(tx, utxo_lookup, &created_in_block)?;
+            // In checkpoint mode, skip input lookup and conservation checks
+            // We still apply the state changes and will verify state root
+            let input_boxes: Vec<ErgoBox> = if checkpoint_mode {
+                // In checkpoint mode, we don't have the input boxes
+                // Just track spent box IDs without the original box data
+                Vec::new()
+            } else {
+                // 3. Collect input boxes (from UTXO state or created earlier in this block)
+                self.collect_input_boxes(tx, utxo_lookup, &created_in_block)?
+            };
 
-            // 4. Collect data input boxes
-            let data_input_boxes: Vec<ErgoBox> =
-                self.collect_data_input_boxes(tx, utxo_lookup, &created_in_block)?;
+            // 4. Collect data input boxes (skip in checkpoint mode)
+            let data_input_boxes: Vec<ErgoBox> = if checkpoint_mode {
+                Vec::new()
+            } else {
+                self.collect_data_input_boxes(tx, utxo_lookup, &created_in_block)?
+            };
 
-            // 5. Check data inputs don't intersect with inputs
-            self.validate_no_data_input_intersection(tx)?;
+            // Skip validation checks in checkpoint mode
+            if !checkpoint_mode {
+                // 5. Check data inputs don't intersect with inputs
+                self.validate_no_data_input_intersection(tx)?;
 
-            // 6. Verify ERG conservation
-            let fee = validate_erg_conservation(tx, &input_boxes)?;
+                // 6. Verify ERG conservation
+                let fee = validate_erg_conservation(tx, &input_boxes)?;
 
-            // For non-coinbase, fee must be positive (at least cover minimum)
-            if !is_coinbase && fee < MIN_BOX_VALUE {
-                return Err(ConsensusError::InsufficientFee {
-                    provided: fee,
-                    required: MIN_BOX_VALUE,
-                });
-            }
-
-            // 7. Verify token conservation
-            validate_token_conservation(tx, &input_boxes, is_coinbase)?;
-
-            // 8. Validate output box values (minimum value check)
-            for (out_idx, output) in tx.outputs.iter().enumerate() {
-                let value = u64::from(output.value);
-                if value < MIN_BOX_VALUE {
-                    return Err(ConsensusError::InvalidTransaction(format!(
-                        "Output {} has value {} below minimum {}",
-                        out_idx, value, MIN_BOX_VALUE
-                    )));
-                }
-            }
-
-            // 9. Execute ErgoScript verification (unless skipped for testing)
-            if !self.skip_script_verification && !is_coinbase {
-                let result = verifier.verify_tx(tx, &input_boxes, &data_input_boxes);
-
-                if !result.valid {
-                    return Err(ConsensusError::ScriptVerificationFailed {
-                        tx_id: hex::encode(&tx_id),
-                        error: result.error.unwrap_or_else(|| "Unknown error".to_string()),
+                // For non-coinbase, fee must be positive (at least cover minimum)
+                if !is_coinbase && fee < MIN_BOX_VALUE {
+                    return Err(ConsensusError::InsufficientFee {
+                        provided: fee,
+                        required: MIN_BOX_VALUE,
                     });
                 }
 
-                // Accumulate cost
-                total_cost = total_cost.saturating_add(result.cost);
+                // 7. Verify token conservation
+                validate_token_conservation(tx, &input_boxes, is_coinbase)?;
 
-                // Check block cost limit
-                if total_cost > self.max_block_cost {
-                    return Err(ConsensusError::BlockCostExceeded {
-                        cost: total_cost,
-                        max: self.max_block_cost,
-                    });
+                // 8. Validate output box values (minimum value check)
+                for (out_idx, output) in tx.outputs.iter().enumerate() {
+                    let value = u64::from(output.value);
+                    if value < MIN_BOX_VALUE {
+                        return Err(ConsensusError::InvalidTransaction(format!(
+                            "Output {} has value {} below minimum {}",
+                            out_idx, value, MIN_BOX_VALUE
+                        )));
+                    }
+                }
+
+                // 9. Execute ErgoScript verification (unless skipped for testing)
+                if !self.skip_script_verification && !is_coinbase {
+                    if let Some(ref v) = verifier {
+                        let result = v.verify_tx(tx, &input_boxes, &data_input_boxes);
+
+                        if !result.valid {
+                            return Err(ConsensusError::ScriptVerificationFailed {
+                                tx_id: hex::encode(&tx_id),
+                                error: result.error.unwrap_or_else(|| "Unknown error".to_string()),
+                            });
+                        }
+
+                        // Accumulate cost
+                        total_cost = total_cost.saturating_add(result.cost);
+
+                        // Check block cost limit
+                        if total_cost > self.max_block_cost {
+                            return Err(ConsensusError::BlockCostExceeded {
+                                cost: total_cost,
+                                max: self.max_block_cost,
+                            });
+                        }
+                    }
                 }
             }
 
             // 10. Record spent boxes
-            for (input, input_box) in tx.inputs.iter().zip(input_boxes.iter()) {
+            // In checkpoint mode, we only track box IDs for double-spend detection
+            // but don't record SpentBox (no rollback support in checkpoint mode)
+            for input in tx.inputs.iter() {
                 let box_id = input.box_id.as_ref().to_vec();
                 spent_in_block.insert(box_id.clone());
-                spent_boxes.push(SpentBox {
-                    box_id,
-                    original_box: input_box.clone(),
-                });
+            }
+
+            // Only record full SpentBox data outside checkpoint mode (needed for rollback)
+            if !checkpoint_mode {
+                for (input, input_box) in tx.inputs.iter().zip(input_boxes.iter()) {
+                    let box_id = input.box_id.as_ref().to_vec();
+                    spent_boxes.push(SpentBox {
+                        box_id,
+                        original_box: input_box.clone(),
+                    });
+                }
             }
 
             // 11. Record created boxes and add to created_in_block for potential intra-block spending

@@ -109,8 +109,12 @@ impl HeaderValidator for DefaultHeaderValidator {
         // 4. Check parent ID matches
         // Note: This should be validated by the caller who has the actual parent
 
-        // 5. Check version is valid
-        if header.version < 1 || header.version > 3 {
+        // 5. Check version is valid (1-4)
+        // Version 1: Initial mainnet version
+        // Version 2: Hardening hard-fork (Autolykos v2, witnesses in tx Merkle tree)
+        // Version 3: 5.0 soft-fork (JITC, EIP-39)
+        // Version 4: 6.0 soft-fork (EIP-50)
+        if header.version < 1 || header.version > 4 {
             return Err(ConsensusError::InvalidHeader(format!(
                 "Invalid version: {}",
                 header.version

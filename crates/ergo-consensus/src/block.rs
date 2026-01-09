@@ -219,26 +219,60 @@ impl BlockTransactions {
 
     /// Compute the merkle root of the transactions.
     /// This uses the same algorithm as the Scala node to produce the transactions root hash.
+    ///
+    /// For block version 1: Merkle tree over transaction IDs only
+    /// For block version > 1: Merkle tree over (transaction IDs ++ witness IDs)
+    ///
+    /// Transaction ID = blake2b256(bytes_to_sign) - already computed by ergo-lib as tx.id()
+    /// Witness ID = blake2b256(concatenated spending proofs).tail (31 bytes, first byte removed)
     pub fn compute_merkle_root(&self) -> Digest32 {
+        use ergo_chain_types::blake2b256_hash;
         use ergo_merkle_tree::{MerkleNode, MerkleTree};
 
         if self.txs.is_empty() {
-            return Digest32::zero();
+            // Special case for empty merkle tree - matches Scala's emptyMerkleTreeRoot
+            return Digest32::from(blake2b256_hash(&[]));
         }
 
-        // Create leaf nodes from serialized transaction bytes
-        let leaves: Vec<MerkleNode> = self
+        // Collect transaction IDs (32 bytes each)
+        let tx_ids: Vec<Vec<u8>> = self
             .txs
             .iter()
-            .filter_map(|tx| {
-                tx.sigma_serialize_bytes()
-                    .ok()
-                    .map(|bytes| MerkleNode::from_bytes(bytes))
-            })
+            .map(|tx| tx.id().0.as_ref().to_vec())
             .collect();
 
+        // For block version 1, only use transaction IDs
+        // For version > 1, also include witness IDs
+        let leaves: Vec<MerkleNode> = if self.block_version == 1 {
+            tx_ids.into_iter().map(MerkleNode::from_bytes).collect()
+        } else {
+            // Compute witness IDs for each transaction
+            // witnessSerializedId = hash(concat of all spending proofs).tail (31 bytes)
+            let witness_ids: Vec<Vec<u8>> = self
+                .txs
+                .iter()
+                .map(|tx| {
+                    // Concatenate all spending proofs
+                    let mut all_proofs = Vec::new();
+                    for input in tx.inputs.iter() {
+                        all_proofs.extend_from_slice(input.spending_proof.proof.as_ref());
+                    }
+                    // Hash and take tail (remove first byte) to get 31-byte witness ID
+                    let hash = blake2b256_hash(&all_proofs);
+                    hash.as_ref()[1..].to_vec() // .tail removes first byte
+                })
+                .collect();
+
+            // Combine tx_ids and witness_ids
+            tx_ids
+                .into_iter()
+                .chain(witness_ids)
+                .map(MerkleNode::from_bytes)
+                .collect()
+        };
+
         if leaves.is_empty() {
-            return Digest32::zero();
+            return Digest32::from(blake2b256_hash(&[]));
         }
 
         let tree = MerkleTree::new(leaves);

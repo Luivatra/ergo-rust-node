@@ -1,6 +1,6 @@
 //! Node info handler.
 
-use crate::{ApiResult, AppState, API_VERSION};
+use crate::{ApiResult, AppState, NODE_VERSION};
 use axum::{extract::State, Json};
 use serde::Serialize;
 
@@ -50,7 +50,7 @@ pub async fn get_info(State(state): State<AppState>) -> ApiResult<Json<NodeInfo>
 
     let info = NodeInfo {
         name: state.node_name.clone(),
-        app_version: API_VERSION.to_string(),
+        app_version: NODE_VERSION.to_string(),
         full_height: utxo_height,
         headers_height: header_height,
         best_header_id: best_header_id.clone(),

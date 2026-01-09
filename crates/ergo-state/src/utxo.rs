@@ -671,6 +671,101 @@ impl UtxoState {
         Ok(())
     }
 
+    /// Add a state change to an external batch without executing it.
+    /// This allows batching multiple blocks into a single write.
+    /// Call `update_height_in_memory` after the batch is executed.
+    #[instrument(skip(self, batch, change), fields(created = change.created.len(), spent = change.spent.len()))]
+    pub fn add_change_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        change: &StateChange,
+        new_height: u32,
+    ) -> StateResult<()> {
+        // Create undo data to enable rollback
+        let mut undo = UndoData::new(new_height);
+
+        // Remove spent boxes (but save them for undo)
+        for box_id in &change.spent {
+            // Get the box data before removing it (for undo and index removal)
+            if let Some(entry) = self.get_box(box_id)? {
+                // Remove from ErgoTree index
+                let ergotree_hash = Self::hash_ergotree(&entry.ergo_box);
+                self.remove_from_index(
+                    batch,
+                    columns::ERGOTREE_INDEX,
+                    &ergotree_hash,
+                    box_id.as_ref(),
+                )?;
+
+                // Remove from Token index for each token in the box
+                for token in entry
+                    .ergo_box
+                    .tokens
+                    .as_ref()
+                    .map(|t| t.as_slice())
+                    .unwrap_or(&[])
+                {
+                    let token_id = token.token_id.as_ref();
+                    self.remove_from_index(batch, columns::TOKEN_INDEX, token_id, box_id.as_ref())?;
+                }
+
+                undo.spent_boxes.push(entry);
+            } else {
+                return Err(StateError::BoxNotFound(hex::encode(box_id.as_ref())));
+            }
+            batch.delete(columns::UTXO, box_id.as_ref().to_vec());
+        }
+
+        // Add created boxes (and record their IDs for undo)
+        for entry in &change.created {
+            let serialized = entry.serialize()?;
+            let box_id_bytes = entry.box_id_bytes();
+            undo.created_box_ids.push(box_id_bytes.clone());
+
+            // Add to ErgoTree index
+            let ergotree_hash = Self::hash_ergotree(&entry.ergo_box);
+            self.add_to_index(
+                batch,
+                columns::ERGOTREE_INDEX,
+                &ergotree_hash,
+                &box_id_bytes,
+            )?;
+
+            // Add to Token index for each token in the box
+            for token in entry
+                .ergo_box
+                .tokens
+                .as_ref()
+                .map(|t| t.as_slice())
+                .unwrap_or(&[])
+            {
+                let token_id = token.token_id.as_ref();
+                self.add_to_index(batch, columns::TOKEN_INDEX, token_id, &box_id_bytes)?;
+            }
+
+            batch.put(columns::UTXO, box_id_bytes, serialized);
+        }
+
+        // Store undo data keyed by height
+        let undo_key = new_height.to_be_bytes().to_vec();
+        let undo_bytes = undo.serialize()?;
+        batch.put(ColumnFamily::UndoData, undo_key, undo_bytes);
+
+        // Update height in batch
+        batch.put(
+            ColumnFamily::Metadata,
+            b"utxo_height",
+            new_height.to_be_bytes().to_vec(),
+        );
+
+        Ok(())
+    }
+
+    /// Update in-memory height after a batched write is executed.
+    pub fn update_height_in_memory(&self, new_height: u32) {
+        *self.height.write() = new_height;
+    }
+
     /// Apply a state change and compute new state root using AVL tree.
     #[instrument(skip(self, change, prover), fields(created = change.created.len(), spent = change.spent.len()))]
     pub fn apply_change_with_proof(

@@ -25,8 +25,11 @@ use axum::Router;
 /// Default API port.
 pub const DEFAULT_API_PORT: u16 = 9053;
 
-/// API version.
+/// API version (matches Scala node API compatibility).
 pub const API_VERSION: &str = "5.0.0";
+
+/// Node version (our Rust implementation version).
+pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Create the API router with all routes.
 pub fn build_api(state: AppState) -> Router {

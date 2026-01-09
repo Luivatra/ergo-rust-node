@@ -350,12 +350,6 @@ impl Message {
             }
             Message::SyncInfo(info) => {
                 let serialized = info.serialize();
-                // Debug: log all bytes of serialized SyncInfo
-                tracing::info!(
-                    "SyncInfo serialized: len={}, all_bytes={:02x?}",
-                    serialized.len(),
-                    &serialized
-                );
                 buf.extend_from_slice(&serialized);
             }
             Message::Inv(inv) => {
