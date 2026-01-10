@@ -33,6 +33,9 @@ parking_lot.workspace = true
 hex.workspace = true
 rand.workspace = true
 blake2.workspace = true
+num_cpus = "1.16"
+num-bigint.workspace = true
+typenum.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

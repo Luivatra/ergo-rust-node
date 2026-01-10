@@ -9,7 +9,7 @@ use ergo_consensus::block::{
 };
 use ergo_consensus::FullBlockValidator;
 use ergo_mempool::Mempool;
-use ergo_mining::{CandidateGenerator, Miner, MinerConfig};
+use ergo_mining::{CandidateGenerator, Miner, MinerConfig, NetworkPrefix};
 use ergo_network::{
     DeclaredAddress, Handshake, Message, NetworkCommand, NetworkConfig, NetworkEvent,
     NetworkService, PeerId, PeerManager, PeerSpec, MAINNET_MAGIC, TESTNET_MAGIC,
@@ -135,6 +135,13 @@ impl Node {
             }
         }
 
+        // Determine network prefix for address parsing
+        let network_prefix = if config.network == "testnet" {
+            NetworkPrefix::Testnet
+        } else {
+            NetworkPrefix::Mainnet
+        };
+
         // Initialize miner if enabled
         let miner = if config.mining.enabled {
             let candidate_gen = Arc::new(CandidateGenerator::new(
@@ -142,15 +149,36 @@ impl Node {
                 Arc::clone(&mempool),
             ));
 
+            // Determine effective thread count
+            let threads = if config.mining.threads == 0 {
+                num_cpus::get().max(1)
+            } else {
+                config.mining.threads
+            };
+
             let miner_config = MinerConfig {
-                internal_mining: false,
+                internal_mining: config.mining.internal,
                 external_mining: config.mining.external,
                 reward_address: config.mining.reward_address.clone().unwrap_or_default(),
-                threads: 1,
+                threads,
+                network: network_prefix,
             };
 
             let miner = Arc::new(Miner::new(miner_config, candidate_gen));
             miner.start();
+
+            // Log mining configuration
+            if config.mining.internal {
+                info!(
+                    threads = threads,
+                    address = ?config.mining.reward_address,
+                    "Internal CPU mining enabled"
+                );
+            }
+            if config.mining.external {
+                info!("External miner API enabled");
+            }
+
             Some(miner)
         } else {
             None
@@ -205,6 +233,18 @@ impl Node {
 
         // Start synchronization
         self.start_sync().await?;
+
+        // Start internal mining if enabled
+        if let Some(ref miner) = self.miner {
+            if miner.config().internal_mining {
+                let miner_clone = Arc::clone(miner);
+                tokio::spawn(async move {
+                    if let Err(e) = miner_clone.start_internal_mining().await {
+                        error!("Internal mining error: {}", e);
+                    }
+                });
+            }
+        }
 
         // Main loop
         while !self.shutdown.load(Ordering::SeqCst) {

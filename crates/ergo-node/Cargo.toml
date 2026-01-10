@@ -47,6 +47,7 @@ tracing-subscriber.workspace = true
 
 # Utilities
 hex.workspace = true
+num_cpus = "1.16"
 
 [dev-dependencies]
 tempfile = "3"

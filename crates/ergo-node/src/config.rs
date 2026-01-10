@@ -100,14 +100,37 @@ impl Default for ApiConfig {
 }
 
 /// Mining configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MiningConfig {
     /// Enable mining.
     pub enabled: bool,
-    /// Use external miner.
+    /// Use internal CPU mining.
+    #[serde(default)]
+    pub internal: bool,
+    /// Use external miner (API-based).
+    #[serde(default = "default_true")]
     pub external: bool,
     /// Reward address.
     pub reward_address: Option<String>,
+    /// Number of mining threads (0 = auto-detect based on CPU cores).
+    #[serde(default)]
+    pub threads: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for MiningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            internal: false,
+            external: true,
+            reward_address: None,
+            threads: 0, // Auto-detect
+        }
+    }
 }
 
 /// Wallet configuration.
@@ -151,6 +174,16 @@ impl NodeConfig {
         config.network_config.bind_address = args.p2p_bind.clone();
         config.api.bind_address = args.api_bind.clone();
         config.mining.enabled = args.mining;
+
+        // Internal mining implies mining is enabled
+        if args.internal_mining {
+            config.mining.enabled = true;
+            config.mining.internal = true;
+        }
+
+        if args.mining_threads > 0 {
+            config.mining.threads = args.mining_threads;
+        }
 
         if let Some(ref addr) = args.mining_address {
             config.mining.reward_address = Some(addr.clone());

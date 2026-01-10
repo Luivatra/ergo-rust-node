@@ -79,7 +79,8 @@ impl CandidateGenerator {
 
     /// Generate a new block candidate.
     pub fn generate(&self) -> MiningResult<BlockCandidate> {
-        let reward_addr = self
+        // Validate that a reward address is set (used in coinbase transaction creation)
+        let _reward_addr = self
             .reward_address
             .read()
             .clone()

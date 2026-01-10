@@ -1,5 +1,6 @@
 # GAP_08: Internal CPU Mining
 
+## Status: IMPLEMENTED
 ## Priority: LOW
 ## Effort: Medium
 ## Category: Mining
@@ -12,9 +13,71 @@ The Rust Ergo node supports external miners (via the mining API) but lacks inter
 
 ---
 
-## Current State (Rust)
+## Implementation Summary
 
-### What Exists
+Internal CPU mining has been fully implemented with the following components:
+
+### Files Created/Modified
+
+| File | Description |
+|------|-------------|
+| `crates/ergo-mining/src/solver.rs` | Autolykos v2 PoW solver with batch processing |
+| `crates/ergo-mining/src/worker.rs` | Mining worker threads with WorkerPool management |
+| `crates/ergo-mining/src/miner.rs` | Extended with internal mining coordination |
+| `crates/ergo-mining/src/lib.rs` | Exports for new modules |
+| `crates/ergo-mining/Cargo.toml` | Added num_cpus, num-bigint, typenum dependencies |
+| `crates/ergo-node/src/config.rs` | Added internal mining configuration |
+| `crates/ergo-node/src/main.rs` | Added --internal-mining and --mining-threads CLI args |
+| `crates/ergo-node/src/node.rs` | Integrated internal mining startup |
+
+### Key Features
+
+1. **Autolykos v2 Solver** (`solver.rs`):
+   - Blake2b-based PoW algorithm
+   - k=32 elements per nonce attempt
+   - Height-dependent N parameter
+   - Batch processing with cancellation support
+   - Solution verification
+
+2. **Mining Workers** (`worker.rs`):
+   - Multi-threaded worker pool
+   - Watch channel for task broadcasting
+   - MPSC channel for solution reporting
+   - Hash rate tracking
+   - Graceful shutdown
+
+3. **Mining Coordinator** (`miner.rs`):
+   - `start_internal_mining()` async method
+   - Block candidate generation
+   - Solution handling
+   - Statistics tracking
+
+4. **Configuration**:
+   - `--internal-mining` CLI flag
+   - `--mining-threads <N>` CLI option
+   - TOML config support
+
+### Usage
+
+```bash
+# Start node with internal mining (4 threads)
+ergo-node --internal-mining --mining-threads 4 --config ergo-node.toml
+```
+
+```toml
+# ergo-node.toml
+[mining]
+enabled = true
+internal = true
+threads = 4
+reward_address = "9f..."
+```
+
+---
+
+## Previous State (Rust)
+
+### What Existed
 
 In `crates/ergo-mining/`:
 - **Block candidate generation** - Complete (`candidate.rs`)
@@ -23,13 +86,13 @@ In `crates/ergo-mining/`:
 - **External miner protocol** - Framework in place (`miner.rs`)
 - **Mining API** - GET/POST endpoints for candidates and solutions
 
-### What's Missing
+### What Was Missing (Now Implemented)
 
-1. **Autolykos v2 PoW solver** - The actual mining algorithm
-2. **Mining threads** - Multi-threaded PoW search
-3. **Nonce iteration** - Systematic nonce exploration
-4. **Table generation** - 2GB lookup table for Autolykos
-5. **Solution submission** - Internal submission path
+1. ~~**Autolykos v2 PoW solver**~~ - Implemented in `solver.rs`
+2. ~~**Mining threads**~~ - Implemented in `worker.rs`
+3. ~~**Nonce iteration**~~ - Batch processing in solver
+4. ~~**Table generation**~~ - Not needed for CPU mining (on-the-fly calculation)
+5. ~~**Solution submission**~~ - Integrated in miner coordination
 
 ---
 

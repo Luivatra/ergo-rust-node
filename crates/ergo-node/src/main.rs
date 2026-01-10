@@ -18,7 +18,7 @@ use node::Node;
 #[derive(Parser, Debug)]
 #[command(name = "ergo-node")]
 #[command(author, version, about, long_about = None)]
-struct Args {
+pub struct Args {
     /// Path to configuration file
     #[arg(short, long, default_value = "ergo-node.toml")]
     config: PathBuf,
@@ -34,6 +34,14 @@ struct Args {
     /// Enable mining
     #[arg(long)]
     mining: bool,
+
+    /// Enable internal CPU mining
+    #[arg(long)]
+    internal_mining: bool,
+
+    /// Number of mining threads (0 = auto-detect)
+    #[arg(long, default_value = "0")]
+    mining_threads: usize,
 
     /// Mining reward address
     #[arg(long)]

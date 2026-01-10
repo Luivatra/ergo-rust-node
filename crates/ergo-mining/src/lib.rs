@@ -7,12 +7,15 @@
 //! - Transaction selection by fee
 //! - Coinbase transaction creation
 //! - External miner protocol (stratum-like)
+//! - Internal CPU mining with worker threads
 //! - Solution verification and submission
 
 mod candidate;
 mod coinbase;
 mod error;
 mod miner;
+mod solver;
+mod worker;
 
 pub use candidate::{BlockCandidate, CandidateGenerator};
 pub use coinbase::{
@@ -21,7 +24,9 @@ pub use coinbase::{
 };
 pub use ergo_lib::ergotree_ir::chain::address::NetworkPrefix;
 pub use error::{MiningError, MiningResult};
-pub use miner::{Miner, MinerConfig};
+pub use miner::{Miner, MinerConfig, MiningStats};
+pub use solver::AutolykosSolver;
+pub use worker::{FoundSolution, MiningTask, MiningWorker, WorkerPool};
 
 /// Default mining reward address (placeholder).
 pub const DEFAULT_REWARD_ADDRESS: &str = "";
